@@ -1,0 +1,25 @@
+# original game data (copyright — supply your own)
+/orig/
+
+# build tool (download MADS separately)
+mads.exe
+
+# build outputs
+/out/
+*.xex
+*.atr
+*.lst
+*.lab
+*.bin
+
+# python
+__pycache__/
+*.pyc
+
+# backups / scratch
+*.bak
+/_zal/
+/video/
+
+# editor / agent
+.claude/
