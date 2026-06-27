@@ -4,11 +4,18 @@ A port of **Another World** (a.k.a. *Out of This World*) to the **Atari XL/XE** 
 
 The repo ships the **engine source and build tooling** — it does **not** include the original game data (see below).
 
-## Requirements
+## Hardware
+
+Runs on **real Atari hardware** — no emulator required.
+
+- **Atari XE/XL** with **64 KB RAM** and **VBXE**.
+- **Rapidus** accelerator **recommended** (for full speed).
+- [Altirra](https://www.virtualdub.org/altirra.html) (with VBXE) is optional, for development/testing.
+
+## Build requirements
 
 - **[Mad Assembler (MADS)](https://github.com/tebe6502/Mad-Assembler)** — put `mads.exe` in the project root (the build scripts call `.\mads.exe`).
 - **Python 3** — for the asset/data pipeline in `tools/`.
-- **[Altirra](https://www.virtualdub.org/altirra.html)** with **VBXE** enabled — to run the output.
 
 ## Original game data (not included)
 
@@ -36,7 +43,7 @@ Run from the project root.
 .\build_awgame.ps1
 ```
 
-Then boot `awgame.atr` on **D1:** in Altirra (VBXE on), or run `awintro.xex` directly.
+Then boot `awgame.atr` from **D1:** on an Atari XE/XL (VBXE; Rapidus recommended), or run `awintro.xex` directly. Altirra with VBXE also works for testing.
 
 ## Layout
 
