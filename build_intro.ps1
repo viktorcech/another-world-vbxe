@@ -20,4 +20,4 @@ Write-Host "[3/3] assemble awintro.xex"
 & ".\mads.exe" "src\awvbxe.asm" "-o:awintro.xex" | Select-Object -Last 1
 
 Write-Host ""
-Write-Host "Done. Run awintro.xex in Altirra (VBXE required) to hear the SFX."
+Write-Host "Done. Run awintro.xex on an Atari XE/XL (VBXE required) to hear the SFX."

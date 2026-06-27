@@ -6,11 +6,10 @@ The repo ships the **engine source and build tooling** — it does **not** inclu
 
 ## Hardware
 
-Runs on **real Atari hardware** — no emulator required.
+Runs on **real Atari hardware**.
 
 - **Atari XE/XL** with **64 KB RAM** and **VBXE**.
 - **Rapidus** accelerator **recommended** (for full speed).
-- [Altirra](https://www.virtualdub.org/altirra.html) (with VBXE) is optional, for development/testing.
 
 ## Build requirements
 
@@ -19,7 +18,7 @@ Runs on **real Atari hardware** — no emulator required.
 
 ## Original game data (not included)
 
-The game build packs assets from the **original DOS release** of Another World, which is **© Delphine Software** and is **not distributed here**. To build the full game disk you must supply your own legally-owned copy.
+The game build packs assets from the **original DOS release of Another World**. Its intellectual property is owned by **Éric Chahi** — the game was originally published by Delphine Software in 1991, and Chahi acquired the rights after Delphine closed in 2004. Those original assets are **not distributed here**; to build the full game disk you must supply your own legally-owned copy.
 
 Create an `orig/` folder in the project root containing the original DOS files:
 
@@ -43,7 +42,7 @@ Run from the project root.
 .\build_awgame.ps1
 ```
 
-Then boot `awgame.atr` from **D1:** on an Atari XE/XL (VBXE; Rapidus recommended), or run `awintro.xex` directly. Altirra with VBXE also works for testing.
+Then boot `awgame.atr` from **D1:** on an Atari XE/XL (VBXE; Rapidus recommended), or run `awintro.xex` directly.
 
 ## Layout
 
@@ -56,6 +55,6 @@ Then boot `awgame.atr` from **D1:** on an Atari XE/XL (VBXE; Rapidus recommended
 
 ## Credits
 
-- Original game: **Another World** by Éric Chahi / Delphine Software (1991).
+- Original game: **Another World** — created by Éric Chahi, originally published by Delphine Software (1991); IP owned by Éric Chahi.
 - Some files under `tools/` (`_rawgl_*`, `_staticres.cpp`) derive from the open-source **[rawgl](https://github.com/cyxx/rawgl)** reimplementation by Gregory Montoir, used to interpret the original bytecode/resources.
 - Atari XL/XE + VBXE port: **w1k**.

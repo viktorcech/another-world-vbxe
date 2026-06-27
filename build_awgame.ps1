@@ -38,4 +38,4 @@ python "tools\check_xex.py" "awgame.xex"
 if ($LASTEXITCODE -ne 0) { throw "check_xex.py FAILED - an XEX segment lands in reserved RAM (window/ROM/VM)" }
 
 Write-Host ""
-Write-Host "Done. Boot awgame.atr on D1: in Altirra (it loads awgame.xex, then streams parts)."
+Write-Host "Done. Boot awgame.atr on D1: on an Atari XE/XL (it loads awgame.xex, then streams parts)."
