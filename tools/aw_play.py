@@ -66,8 +66,10 @@ class Player:
             elif op == 0x07:                    # DRAWTEXT
                 strId = self.u16(); x = self.u8(); y = self.u8(); col = self.u8()
                 aw_text.draw_string(self.pages[self.cur1], W, strId, x, y, col)
-            elif op == 0x08:                    # SOUND (idx) -- no audio here; consume operand
-                self.u8()
+            elif op == 0x08:                    # SOUND idx,vol -- no audio here; consume operands
+                self.u8(); self.u8()
+            elif op == 0x09:                    # MUSIC start -- no operands, no audio here
+                pass
             elif op == 0x06:                    # BLIT
                 pg = self.u8(); hold = self.u8()
                 self.frames.append((bytes(self.pages[pg]), self.curpal, hold))

@@ -91,6 +91,9 @@
         jsr set_cbase_cur
         lda #1                      ; the snapshot may hold pending treq/tpreq ->
         sta req_any                 ;   force the next apply scan
+        lda #64                     ; the restore wrote tpc[] directly (bypassing the
+        sta vm_maxt                 ;   apply scan), so the run-loop watermark must
+                                    ;   cover ALL threads again (over-scan is safe)
         ldx #0                      ; bring the var file back (hero x/y/state/...)
 ?v      lda SNAP_V,x
         sta var_lo,x

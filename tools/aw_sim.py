@@ -393,7 +393,9 @@ class VM:
     def op_memlist(self):
         num=self.w()
         if num>=0x3E80: self.running=False     # part switch -> intro done
-    def op_music(self): self.w(); self.w(); self.b()
+    def op_music(self):
+        res=self.w(); delay=self.w(); pos=self.b()
+        self.events.append(('mus', res, delay, pos))
 
     def run(self, maxframes=400):
         self.maxframes = maxframes

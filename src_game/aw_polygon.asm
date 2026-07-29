@@ -3,11 +3,14 @@
 ;   pl_addr (24-bit) walks $060000.. ; bank = pl_addr>>14, win = $4000+addr&$3FFF.
 ;   Sets the bank every byte so it stays correct when interleaved with poly_byte.
 ;=============================================================================
-; GAME fork (aw2 + aw3): the VM hammers pl_byte (3-4x per opcode). Mirror poly_fetch
-; -- a running window pointer (pl_whi:pl_wlo) + a cached bank (pl_bank), recomputed
-; only on a 16K crossing, with set_pl_ptr doing the heavy math once per jump. aw3 drops
-; the per-byte pl_lo/pl_mid (the PC is DERIVED from the pointer on save, vm_save_pc), so
-; operand fetches inline via mfetch -- skipping jsr/rts AND the per-fetch bank re-own.
+; GAME fork (aw2 + aw3): the VM hammers the bytecode fetch (3-4x per opcode). Mirror
+; poly_fetch -- a running window pointer (pl_whi:pl_wlo) + a cached bank (pl_bank),
+; recomputed only on a 16K crossing, with set_pl_ptr doing the heavy math once per
+; jump. aw3 drops the per-byte pl_lo/pl_mid (the PC is DERIVED from the pointer on
+; save, vm_save_pc), so operand fetches inline via mfetch -- skipping jsr/rts AND
+; the per-fetch bank re-own. (2026-07-02 fps wave: the old `pl_byte` OPCODE-fetch
+; routine is gone too -- its body, incl. the bank re-own, is inlined at vm_fetch
+; in game_vm_sched.asm, and every mid-opcode caller now uses mfetch.)
 
 ; pl_wrap : handle the rare pointer wrap (256-byte page / 16K bank). Preserves A.
 .proc pl_wrap
@@ -35,22 +38,6 @@
         bne *+5                     ; no wrap (common) -> skip the 3-byte jsr pl_wrap
         jsr pl_wrap
 .endm
-
-; pl_byte : the OPCODE fetch -- re-owns the MEMAC-B bank (a draw may precede it), then
-;   reads + advances. Operands use mfetch instead.
-.proc pl_byte
-        lda pl_bank                 ; re-own the bank if poly_fetch took it
-        cmp memb_cur
-        beq ?nosw
-        sta memb_cur
-        sta VBXE_MEMAC_B
-?nosw   ldy #0
-        lda (pl_wlo),y              ; A = the bytecode byte (return value)
-        inc pl_wlo
-        bne ?done
-        jsr pl_wrap                 ; preserves A
-?done   rts
-.endp
 
 ; set_pl_ptr : sync pl_bank + the running window pointer (pl_whi:pl_wlo) from the
 ;   logical PC (pl_mid:pl_lo). Call on every PC JUMP (thread entry, jmp/call/ret/
@@ -108,6 +95,17 @@
         beq pf_wrap                 ; ~1/256 : window page crossed
         rts
 .endp
+
+; m_pfetch : poly_fetch INLINED (fps wave) -- drops the 12-cyc jsr/rts on the hot
+;   decode fetches (poly_draw byte0, do_fill nverts, do_hier's 4 per-child reads).
+;   Byte-identical semantics to `jsr poly_fetch` (pf_wrap preserves A).
+.macro m_pfetch
+        ldy #0
+        lda (pb_ptr),y
+        inc pb_ptr
+        bne *+5                     ; no wrap (common) -> skip the 3-byte jsr
+        jsr pf_wrap
+.endm
 
 ; pf_wrap : pb_ptr low wrapped (page cross). A = the just-read data byte, so the
 ;   window check preserves it with pha/pla -- paid only ~1/256 reads. Shared by
@@ -228,9 +226,13 @@ rs_smc  jmp rs_fast                 ; operand = rs_fast / rs_slow (SMC, per shap
 .endp
 
 .proc rs_slow                       ; zoom >= 16384 (never in practice) : the full
-        jsr poly_fetch              ;   generic (m*zoom)>>6 path, kept as fallback
-        sta mul_m
-        jmp mul_zoom                ; tail-call (mul_zoom keeps its own ==64 test)
+        stx ?xs                     ;   generic (m*zoom)>>6 path, kept as fallback.
+        jsr poly_fetch              ;   X is saved/restored: the read_scaled contract
+        sta mul_m                   ;   now guarantees X survives (do_fill ?vl keeps
+        jsr mul_zoom                ;   the vertex index in X) and mul_zoom's fmul_b
+        ldx ?xs                     ;   clobbers X.
+        rts
+?xs     dta 0
 .endp
 
 ; rs_z4 : scaled = (m * dr_zoom) >> 6 for zoom < 16384, zoom != 64 -- the per-
@@ -245,19 +247,19 @@ rs_smc  jmp rs_fast                 ; operand = rs_fast / rs_slow (SMC, per shap
         lda (pb_ptr),y              ; inlined poly_fetch
         inc pb_ptr
         beq ?w
-?go     tax                         ; X = m (the table 'b' index)
-        sec                         ; p2 = z4_hi * m  (16-bit, chained sbc)
-fzh_1   lda fmul_sq1l,x             ; operand low bytes = 'a' (z4_hi), patched
-fzh_2   sbc fmul_sq2l,x             ;   by rs_z4_set (fmulu convention)
-        sta g_scaled_lo
-fzh_3   lda fmul_sq1h,x
-fzh_4   sbc fmul_sq2h,x
+?go     tay                         ; Y = m (the table 'b' index). Y, NOT X: the fps
+        sec                         ;   wave keeps X = vertex index alive across
+fzh_1   lda fmul_sq1l,y             ;   read_scaled in do_fill's ?vl loop, so every
+fzh_2   sbc fmul_sq2l,y             ;   read_scaled path must PRESERVE X. abs,y costs
+        sta g_scaled_lo             ;   the same as abs,x here. p2 = z4_hi * m.
+fzh_3   lda fmul_sq1h,y
+fzh_4   sbc fmul_sq2h,y
         sta g_scaled_hi
         sec                         ; p1 = z4_lo * m ; only hi(p1) is added, but
-fzl_1   lda fmul_sq1l,x             ;   the hi sbc needs the lo borrow -> chain both
-fzl_2   sbc fmul_sq2l,x
-fzl_3   lda fmul_sq1h,x
-fzl_4   sbc fmul_sq2h,x
+fzl_1   lda fmul_sq1l,y             ;   the hi sbc needs the lo borrow -> chain both
+fzl_2   sbc fmul_sq2l,y
+fzl_3   lda fmul_sq1h,y
+fzl_4   sbc fmul_sq2h,y
         clc                         ; scaled = p2 + hi(p1)  (<= 65280, no overflow)
         adc g_scaled_lo
         sta g_scaled_lo
@@ -323,39 +325,40 @@ fmlb_h2 sbc fmul_sq2h,x
         rts
 
 ;=============================================================================
-; Edge slope  slope = (|dx| << 16) / dy , sign of dx applied (16.16, in N0..N3).
+; Edge slope  slope = (|dx| << 16) / dy , sign of dx applied (16.16).
 ;   Reciprocal LUT + QS multiply instead of a 32/16 divide: |dx| is < 256 for
 ;   every edge in this intro (measured), so slope = |dx| * recip[dy], with
 ;   recip[dy] = round(65536/dy). dy==1 -> |dx|<<16 (recip 65536 won't fit 16b).
 ;   The 16-bit |dx|*recip is two QS 8x8 multiplies (was an 8x16 shift-add).
 ;   in : dv_lo:dv_hi (signed dx), hh (8-bit, dy>=1)
+;        X = 0 (right edge) or SMC_LD (left edge)
+;   out: the 4 step bytes are written DIRECTLY into fill_poly_int's ?row SMC
+;        adc-operands via abs,x (fps wave) -- the old N0..N3 staging + the
+;        caller's 8-instruction copy block per edge (~28 cyc) are gone. The
+;        negate is folded into the write-out (0 - N, borrow-chained), so the
+;        old 4-byte eor/adc negate pass is gone too. Same values, same wrap.
 ;=============================================================================
 .proc calc_step
+        stx ?xsv                    ; the fmul calls below clobber X
+        lda #0
+        sta dvsign
         lda dv_hi
-        bpl ?pos
-        sec                         ; dv = -dv  (|dx| now in dv_lo, dv_hi=0)
-        lda #0
-        sbc dv_lo
+        bpl ?abs
+        sec                         ; |dx| = -dv_lo (|dx| < 256 measured, so the
+        lda #0                      ;   low byte is the whole magnitude -- the old
+        sbc dv_lo                   ;   code negated dv_hi too but never read it)
         sta dv_lo
-        lda #0
-        sbc dv_hi
-        sta dv_hi
         lda #1
         sta dvsign
-        jmp ?abs
-?pos    lda #0
-        sta dvsign
-?abs    lda #0
-        sta N0
-        sta N1
-        sta N2
-        sta N3
-        lda hh
+?abs    lda hh
         cmp #1
         bne ?mul
-        lda dv_lo                   ; dy==1 : slope = |dx| << 16
+        lda #0                      ; dy==1 : slope = |dx| << 16 -> N = 0,0,|dx|
+        sta N0
+        sta N1
+        lda dv_lo
         sta N2
-        jmp ?sign
+        jmp ?wr
 ?mul    ; slope = |dx| * recip[hh], recip 16-bit -> two fmulu 8x8 multiplies:
         ;   N(24b) = (|dx|*recip_lo) + (|dx|*recip_hi << 8). |dx| is set once.
         lda dv_lo
@@ -378,27 +381,48 @@ fmlb_h2 sbc fmul_sq2h,x
         sta N1
         lda qp_hi
         adc #0
-        sta N2                      ; N3 stays 0 (cleared at ?abs)
-?sign   lda dvsign
-        beq ?done
-        lda N0                      ; negate slope (32-bit two's complement)
-        eor #$FF
-        clc
-        adc #1
-        sta N0
+        sta N2                      ; N3 is implicit 0 (byte 3 is emitted below)
+?wr     ldx ?xsv                    ; write-out: straight into the ?row SMC adc
+        lda dvsign                  ;   operands (X selects the cr / cl chain)
+        bne ?neg
+        lda N0
+        sta fill_poly_int.smc_cr0+1,x
         lda N1
-        eor #$FF
-        adc #0
-        sta N1
+        sta fill_poly_int.smc_cr1+1,x
         lda N2
-        eor #$FF
-        adc #0
-        sta N2
-        lda N3
-        eor #$FF
-        adc #0
-        sta N3
-?done   rts
+        sta fill_poly_int.smc_cr2+1,x
+        lda #0
+        sta fill_poly_int.smc_cr3+1,x
+        beq ?dbl                    ; (A = 0 -> always taken)
+?neg    sec                         ; step = 0 - N (32-bit, borrow-chained);
+        lda #0                      ;   byte3 = 0-0-borrow = the sign extension
+        sbc N0
+        sta fill_poly_int.smc_cr0+1,x
+        lda #0
+        sbc N1
+        sta fill_poly_int.smc_cr1+1,x
+        lda #0
+        sbc N2
+        sta fill_poly_int.smc_cr2+1,x
+        lda #0
+        sbc #0
+        sta fill_poly_int.smc_cr3+1,x
+?dbl    lda poly_bcb_h              ; half mode (fps wave 2): the paired row loop
+        beq ?ret                    ;   also needs step*2 in the smc2 chain. The
+        lda fill_poly_int.smc_cr0+1,x   ; asl/rol pass over the 4 bytes just
+        asl @                           ; written = (step << 1) mod 2^32, sign-
+        sta fill_poly_int.smc2_cr0+1,x  ; agnostic (two's complement doubles the
+        lda fill_poly_int.smc_cr1+1,x   ; same way). X still selects cr/cl.
+        rol @
+        sta fill_poly_int.smc2_cr1+1,x
+        lda fill_poly_int.smc_cr2+1,x
+        rol @
+        sta fill_poly_int.smc2_cr2+1,x
+        lda fill_poly_int.smc_cr3+1,x
+        rol @
+        sta fill_poly_int.smc2_cr3+1,x
+?ret    rts
+?xsv    dta 0
 .endp
 
 ;=============================================================================
@@ -407,7 +431,7 @@ fmlb_h2 sbc fmul_sq2h,x
 
 ; poly_draw : draw the shape at dr_off with dr_x,dr_y,dr_zoom,dr_col.
 .proc poly_draw
-        jsr poly_fetch              ; A = byte0 ; dr_off++
+        m_pfetch                    ; A = byte0 ; dr_off++  (inlined poly_fetch)
         cmp #$C0
         bcc ?notfill
         ; filled polygon : col = (dr_col&0x80) ? (byte0&0x3F) : dr_col
@@ -443,7 +467,7 @@ fmlb_h2 sbc fmul_sq2h,x
         sta bbh
         lda g_scaled_hi
         sta bbh+1
-        jsr poly_fetch              ; n verts
+        m_pfetch                    ; n verts (inlined poly_fetch)
         sta nverts
         ; g_x0 = dr_x - bbw/2
         lda bbw+1
@@ -515,14 +539,26 @@ fmlb_h2 sbc fmul_sq2h,x
         bcs ?yokx                   ; x1 >= 319 (margin wants <= 318)
 ?fast   ldx #<draw_scanline_fast    ; Y && X in range
         ldy #>draw_scanline_fast
-        jmp ?gset
+        bne ?gyes                   ; (Y = >draw_scanline_fast != 0 -> always taken)
 ?yokx   ldx #<draw_scanline_yok     ; Y in range, X needs clipping -> skip the y-test only
         ldy #>draw_scanline_yok
+?gyes   lda #<fill_poly_int.yk_row  ; Y fully on-screen -> ALSO skip the per-ROW
+        sta fill_poly_int.smc_yj+1  ;   y-bounds test in the ?row loop (fps wave):
+        lda #>fill_poly_int.yk_row  ;   hy provably stays in 0..199, so the ~11-cyc
+        sta fill_poly_int.smc_yj+2  ;   test is dead weight on every scanline
         jmp ?gset
 ?yno    ldx #<draw_scanline         ; Y not fully on-screen -> full per-row y-test + X-clip
         ldy #>draw_scanline
+        lda #<fill_poly_int.yk_tst  ; keep the per-row y-test (early exit past the
+        sta fill_poly_int.smc_yj+1  ;   bottom edge / skip above the top)
+        lda #>fill_poly_int.yk_tst
+        sta fill_poly_int.smc_yj+2
 ?gset   stx fill_poly_int.smc_dsl+1
         sty fill_poly_int.smc_dsl+2
+        stx fill_poly_int.smc_dsh+1 ; the half-mode paired loop has two more
+        sty fill_poly_int.smc_dsh+2 ;   dispatched draw sites (pair + odd-exit
+        stx fill_poly_int.smc_dsi+1 ;   row) -- patch them to the same target
+        sty fill_poly_int.smc_dsi+2
         ; --- cell-cache bake guard: a fill on the CLIP dispatch may lose
         ; content silently (a child fully off-screen at the bake position
         ; emits NO spans -> the extents can't see it) -> the shape must not
@@ -536,37 +572,28 @@ fmlb_h2 sbc fmul_sq2h,x
         lda cc_flag
         ora #$80                    ; abort the bake -> NEVER
         sta cc_flag
-?gnab   lda #0
-        sta g_vidx
+?gnab   ldx #0                      ; X = vertex index, kept LIVE across read_scaled
+                                    ;   (fps wave: rs_fast/rs_z4/rs_slow all preserve
+                                    ;   X now) -- the old pha/tay/ldx/pla shuffle and
+                                    ;   the g_vidx memory cell are gone (~35 cyc/vert)
 ?vl     jsr read_scaled             ; px = g_x0 + scaled
         lda g_x0
         clc
         adc g_scaled_lo
-        pha
+        sta pts_xlo,x
         lda g_x0+1
         adc g_scaled_hi
-        tay
-        ldx g_vidx
-        pla
-        sta pts_xlo,x
-        tya
         sta pts_xhi,x
         jsr read_scaled             ; py = g_y0 + scaled
         lda g_y0
         clc
         adc g_scaled_lo
-        pha
+        sta pts_ylo,x
         lda g_y0+1
         adc g_scaled_hi
-        tay
-        ldx g_vidx
-        pla
-        sta pts_ylo,x
-        tya
         sta pts_yhi,x
-        inc g_vidx
-        lda g_vidx
-        cmp nverts
+        inx
+        cpx nverts
         bne ?vl
         jmp fill_poly_int
 .endp
@@ -589,12 +616,12 @@ fmlb_h2 sbc fmul_sq2h,x
         lda dr_y+1
         sbc g_scaled_hi
         sta by+1
-        jsr poly_fetch              ; child count
+        m_pfetch                    ; child count (inlined poly_fetch, fps wave)
         sta hcount                  ; loop hcount+1 times
 ?loop
-        jsr poly_fetch              ; word hi (big-endian)
+        m_pfetch                    ; word hi (big-endian)
         sta word_hi
-        jsr poly_fetch              ; word lo
+        m_pfetch                    ; word lo
         sta word_lo
         jsr read_scaled             ; cx = bx + scaled
         lda bx
@@ -616,10 +643,10 @@ fmlb_h2 sbc fmul_sq2h,x
         sta ccol
         lda word_hi
         bpl ?nocol                  ; bit15 clear -> no per-child colour
-        jsr poly_fetch              ; ccol = poly[dr_off] & 0x7F
+        m_pfetch                    ; ccol = poly[dr_off] & 0x7F
         and #$7F
         sta ccol
-        jsr poly_fetch              ; (python off += 2 : skip the 2nd byte)
+        m_pfetch                    ; (python off += 2 : skip the 2nd byte)
 ?nocol
         ; --- save _hier state, recurse, restore ---
         ; PERF (optimisation -- GAME FORK ONLY; the intro src/aw_polygon.asm still does the

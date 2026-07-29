@@ -2,7 +2,7 @@
 ; game_text.asm - GAME op_drawstring (bytecode opcode 0x12) : DRAWTEXT.
 ;   Renders the AW string table (game_text_data.inc) through the 8x8 font, the
 ;   same glyph blitter the intro uses (src/aw_text.asm), but driven by the game
-;   bytecode fetch instead of the flattened playlist, and exiting to vm_cont.
+;   bytecode fetch instead of the flattened playlist, and exiting to vm_fetch.
 ;
 ;   This is what shows the death / ACCESS-CODE screen ("PRESS BUTTON OR RETURN
 ;   TO CONTINUE", "ACCESS CODE: ...") -- without it the restart screen is blank
@@ -96,8 +96,8 @@ gtxt_ptr = cr0                       ; $C0-$C1 : string byte ptr (txt_ptr collid
         bcc ?adv1
         inc t_cbx+1
 ?adv1   jmp ?char
-?done   jmp vm_cont
-.endp
+?done   jmp vm_fetch                 ; drawstring never ends the slice -> straight back
+.endp                                ;   to the fetch loop (vm_cont is gone, fps wave)
 
 ; draw_glyph : render glyph t_ch at column t_cx, row txt_y, colour txt_col.
 .proc draw_glyph
@@ -291,6 +291,16 @@ LD_Y    = 96                         ; row in px (200-tall page)
 ?done   jsr blit_idle                ; let the last glyph land before we show the page
         lda vm_cur2
         jsr show_page                ; re-assert the displayed page (now the LOADING screen)
+        ; Keep it up for at least ~0.5 s. Otherwise the screen lives exactly as long as
+        ; the SIO read that follows, and that varies wildly: booted as a bare xex the
+        ; read fails and retries (screen stays for seconds), off the real disk it
+        ; succeeds so fast that the scene replaced it before it could be read at all.
+        ; X is dead here -- load_part reloads it from dk_idx right after this call.
+        lda RTCLOK3
+        adc #25                      ; deadline = now + ~25 vblanks (carry-in -> +-1)
+        tax
+?hold   cpx RTCLOK3
+        bne ?hold
         rts
 ld_str  dta c'LOADING...',0
 .endp

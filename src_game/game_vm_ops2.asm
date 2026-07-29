@@ -203,13 +203,27 @@ op_updatedisplay                     ; 0x10 : show page, apply deferred palette,
         ;     SLICES vblanks (not render+hold). RTCLOK3 ticks once per vblank (VBI);
         ;     we exit right at a tick, so the page flip below is tear-free. (Old code
         ;     waited hold vblanks AFTER the render -> ran ~30-48% too slow on Rapidus.)
+        ;     The flip may ONLY happen just past a tick edge: either the spin OBSERVES
+        ;     the due tick start (due-now goes 1 -> 0) or wait_vblank aligns us.
+        ;     Arriving with due-now ALREADY 0 means the render consumed the whole
+        ;     budget and we are MID-frame: the XDL address is latched at frame START,
+        ;     so a flip now leaves the OLD page on screen for the rest of the frame
+        ;     while the VM already fills/copies it as the new back buffer -> the
+        ;     background flashes through the picture (same bug as the intro's ~f911
+        ;     Rapidus blink, fixed in src/aw_replayer.asm the same way).
 ?wd     lda pace_due
         sec
         sbc RTCLOK3                 ; due - now (signed 8-bit)
-        beq ?due                    ; exactly due (at a vblank tick) -> show tear-free
-        bpl ?wd                     ; due still ahead -> spin (NMI advances RTCLOK3)
-        jsr wait_vblank             ; OVERRAN (slow CPU): late -> sync to vblank so the
-                                    ;   page flip is still tear-free (else stock 6502 tears)
+        beq ?ovr                    ; already due on ARRIVAL -> mid-frame: align
+        bmi ?ovr                    ; overran -> align
+?sp     lda pace_due
+        sec
+        sbc RTCLOK3
+        bne ?sp                     ; due ahead: spin until the observed 1 -> 0
+        beq ?due                    ;   transition = just past the tick edge
+?ovr    jsr wait_vblank             ; late/mid-frame -> sync to vblank so the page
+                                    ;   flip is tear-free and the old page is off
+                                    ;   screen before the VM redraws it
 ?due    lda vm_pend                 ; apply any deferred palette (at the vblank tick)
         bmi ?nopal
         sta vm_lastpal              ; remember the APPLIED palette (ESC-resume re-applies)
@@ -243,9 +257,10 @@ op_updatedisplay                     ; 0x10 : show page, apply deferred palette,
         adc pace_due
         sta pace_due
         sec
-        sbc RTCLOK3                 ; if we've fallen behind (render overran), resync
-        bpl ?cont
-        lda RTCLOK3                 ; deadline = now + hold
+        sbc RTCLOK3                 ; if we've fallen behind (render overran), resync;
+        beq ?rsy                    ;   0 headroom counts as behind too (else pace_due
+        bpl ?cont                   ;   ==now locks every later frame into the overrun
+?rsy    lda RTCLOK3                 ;   path -- the 0-headroom trap, see pacing.txt)
         clc
         adc vm_hold
         sta pace_due

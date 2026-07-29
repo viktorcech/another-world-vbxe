@@ -190,7 +190,8 @@ nv_len  equ *-nv_msg
 ; these for the game; copy into src_game/ if a game-specific change is needed).
 ;=============================================================================
         icl 'src_game/aw_polygon.asm'  ; poly decoder (GAME fork: video2 base select)
-        icl 'src/aw_raster.asm'        ; integer 16.16 raster, scanline -> span
+        icl 'src_game/aw_raster.asm'   ; integer 16.16 raster (GAME fork, fps wave:
+                                       ;   calc_step direct-SMC steps + smc_yj skip)
         icl 'src/aw_vbxe.asm'          ; VBXE bring-up, palette, page/blitter, recip/row
         icl 'src_game/game_vm.asm'     ; the Another World bytecode VM (Phase 1)
 

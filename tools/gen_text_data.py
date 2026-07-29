@@ -18,7 +18,8 @@ PL = os.path.join(PROJ, 'out', 'intro_playlist.bin')
 INC = os.path.join(PROJ, 'src', 'aw_text_data.inc')
 
 # playlist opcode operand lengths (bytes AFTER the opcode), to walk the stream
-OPLEN = {0x01: 1, 0x02: 1, 0x03: 2, 0x04: 2, 0x05: 8, 0x06: 2, 0x07: 5}
+OPLEN = {0x01: 1, 0x02: 1, 0x03: 2, 0x04: 2, 0x05: 8, 0x06: 2, 0x07: 5,
+         0x08: 2, 0x09: 0}
 
 
 def used_ids(pl):

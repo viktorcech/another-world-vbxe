@@ -264,7 +264,8 @@ cc_arhi    = $9EA6                 ; (1) region base-hi temp (set_arena)
         lda #$07
         jmp cc_set_arena            ; tail-call
 .endp
-        ert *>$1FFF                 ; the cold gap ends at the $2000 code segment
+        ert *>$1EFF                 ; the cold gap now ends at $1F00: vm_oplo/vm_ophi
+                                    ;   (game_vm_optab.asm) own $1F00-$1F7F
 
         org $AA00                   ; hot routines continue in the $AA00 gap
 

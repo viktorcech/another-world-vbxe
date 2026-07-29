@@ -6,6 +6,11 @@ pace_due = $BA                      ; RTCLOK3 value when the next frame is DUE (
                                     ; -- mirrors the game fix. $B8/$B9 = snd state, aw_sound.)
 pace_frac = $BB                     ; NTSC speed-comp accumulator (fifths of a vblank)
 
+; keyboard (ESC intro skip). Intro-local: the GAME defines the same two in
+; game_vm.asm, and both builds share src/vbxe.inc -- so they must NOT live there.
+SKSTAT  = $D20F                     ; r: bit2 = 0 while a key is currently held down
+KBCODE  = $D209                     ; r: last keyboard scan code (b6/b7 = shift/ctrl)
+
 start
         sei
         lda PORTB
@@ -145,7 +150,19 @@ replay
         lda #$80+PLAY_BANK0
         sta pl_bnk
 next_op
-        jsr pl_byte
+        ; ESC skips the intro (chains straight into the game via intro_done).
+        ; Polled once per playlist op: SKSTAT bit2 is 0 only WHILE a key is held,
+        ; so KBCODE (which retains the last code forever) is only looked at on a
+        ; live keypress; #$3F strips the shift/ctrl bits. ~7 cyc when idle.
+        lda SKSTAT
+        and #$04
+        bne ?nokey                  ; no key held -> fetch the next op
+        lda KBCODE
+        and #$3F
+        cmp #$1C                    ; ESC scan code
+        bne ?nokey
+        jmp intro_done
+?nokey  jsr pl_byte
         cmp #$00
         beq ?fin                    ; END : stop the intro (was beq replay = loop)
         cmp #$01
@@ -164,19 +181,31 @@ next_op
         beq ?txt
         cmp #$08
         beq ?snd
+        cmp #$09
+        beq ?mus
         jmp next_op
 ?dp     jmp op_drawpoly
 ?txt    jmp op_drawtext
 ?snd    jmp op_sound
+?mus    jmp op_music
 ?fin    jmp intro_done
 
 ;-----------------------------------------------------------------------------
-; op_sound (0x08) : SOUND idx(1) -- fire the POKEY sample player (latest wins).
+; op_sound (0x08) : SOUND idx(1) vol(1) -- fire the POKEY sample player
+;   (latest wins). idx = pitch-baked variant, vol = 0..63 runtime curve.
 ;-----------------------------------------------------------------------------
 op_sound
         jsr pl_byte
-        tax
+        tax                          ; variant idx (pl_byte preserves X)
+        jsr pl_byte                  ; A = vol
         jsr snd_play
+        jmp next_op
+
+;-----------------------------------------------------------------------------
+; op_music (0x09) : no operands -- start the free-running music stream (AUDC2).
+;-----------------------------------------------------------------------------
+op_music
+        jsr mus_play
         jmp next_op
 
 ;=============================================================================
@@ -217,14 +246,27 @@ op_blit
         sta hold
         jsr blit_idle               ; last poly span fired without waiting -> finish it
         ; --- deadline pacing: spin until the frame is DUE (absorbs render time so the
-        ;     frame interval is `hold` vblanks, not render+hold). Exit at a vblank tick
-        ;     -> tear-free flip. (Old code waited hold vblanks AFTER the render.) ---
+        ;     frame interval is `hold` vblanks, not render+hold). The flip may ONLY
+        ;     happen just past a tick edge: either the spin OBSERVES the due tick
+        ;     start (due-now goes 1 -> 0) or wait_vblank aligns us. Arriving with
+        ;     due-now ALREADY 0 means the render consumed the whole budget and we
+        ;     are MID-frame: the XDL address is latched at frame START, so a flip
+        ;     now shows the OLD page for the rest of the frame while the next
+        ;     frame's SEL+COPY already WIPES it -> the background flashes through
+        ;     the picture (the Rapidus blink in the ~f911 Lester close-up, the one
+        ;     stretch where render ~= hold; stock overruns >1 tick there and took
+        ;     the safe wait_vblank path, light frames spin to the edge -- both ok).
 ?wd     lda pace_due
         sec
         sbc RTCLOK3                 ; due - now (signed)
-        beq ?due                    ; exactly due (at tick) -> show tear-free
-        bpl ?wd                     ; due ahead -> spin
-        jsr wait_vblank             ; overran -> sync to vblank so the flip is tear-free
+        beq ?ovr                    ; already due on ARRIVAL -> mid-frame: align
+        bmi ?ovr                    ; overran -> align
+?sp     lda pace_due
+        sec
+        sbc RTCLOK3
+        bne ?sp                     ; due ahead: spin until the observed 1 -> 0
+        beq ?due                    ;   transition = just past the tick edge
+?ovr    jsr wait_vblank
 ?due    lda pend_pal                ; apply any deferred palette now (in vblank),
         bmi ?nopal                  ;   together with the page swap -> no dark flash
         jsr set_palette
@@ -255,10 +297,11 @@ op_blit
         adc pace_due
         sta pace_due
         sec
-        sbc RTCLOK3                 ; resync if we fell behind (render overran)
-        bpl ?bdone
-        lda RTCLOK3
-        clc
+        sbc RTCLOK3                 ; resync if we fell behind (render overran);
+        beq ?rsy                    ;   0 headroom counts as behind too (else
+        bpl ?bdone                  ;   pace_due==now locks every later frame into
+?rsy    lda RTCLOK3                 ;   the overrun path -- the 0-headroom trap,
+        clc                         ;   see pacing.txt)
         adc hold
         sta pace_due
 ?bdone  jmp next_op

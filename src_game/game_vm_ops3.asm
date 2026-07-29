@@ -11,14 +11,11 @@
 ;   Part of the game_vm split.
 ;=============================================================================
 
-op_remove                            ; 0x11 : kill this thread
-        ldx vm_t
+op_remove                            ; 0x11 : kill this thread (also the handler for
+        ldx vm_t                     ;   invalid opcodes $1B-$3F via the optab fill)
         lda #$FF
-        sta tpc_hi,x
-        lda #1
-        sta vm_goto
-        sta vm_rem
-        jmp vm_cont
+        sta tpc_hi,x                 ; INACTIVE -> nothing to save; straight back to
+        rts                          ;   the scheduler (the old vm_goto/vm_rem is gone)
 
 op_drawstring                        ; 0x12 : DRAWTEXT -> game_text.asm (intro glyph blitter).
         jmp do_drawstring            ;   global label keeps op_remove/op_sub ?-scopes separate.
@@ -143,8 +140,7 @@ op_memlist                           ; 0x19 : resource load / part switch
         sta vm_next_hi
         lda #1
         sta vm_switch
-        sta vm_goto                 ; end this thread slice
-        jmp vm_cont
+        jmp vm_exit                 ; end this thread slice (save the PC, rts)
         ; --- a sub-16000 resource: if it's a known background BITMAP, stream it to
         ;     page 0 (luxe etc.); other sub-16000 loads (sounds) stay a no-op.
         ;     (unique ?ml* labels -- a plain ?done here mis-binds op_shl's beq ?done) ---

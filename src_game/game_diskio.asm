@@ -27,12 +27,28 @@ DBYTHI   = $0309
 DAUX1    = $030A                    ; sector number low
 DAUX2    = $030B                    ; sector number high
 
+; POKEY / PIA registers for the in-RAM high-speed SIO path (private names so
+; this file stays self-contained; cannot clash with game_sound's equates).
+p_AUDF3  = $D204
+p_AUDC3  = $D205
+p_AUDF4  = $D206
+p_AUDC4  = $D207
+p_AUDCTL = $D208
+p_SKRES  = $D20A
+p_SERIN  = $D20D                    ; read
+p_SEROUT = $D20D                    ; write
+p_IRQST  = $D20E                    ; read = serial IRQ status
+p_IRQEN  = $D20E                    ; write = IRQ enable
+p_SKCTL  = $D20F
+p_PBCTL  = $D303                    ; PIA CB2 = SIO COMMAND line
+
 ; disk loader scratch (persistent VM-state RAM, after the VM globals)
 dk_sec   = $B3C8                    ; (2) current sector
 dk_cnt   = $B3CA                    ; (2) remaining sector count
 dk_bank  = $B3CC                    ; current VRAM bank
 dk_n     = $B3CD                    ; sectors this chunk (<=128 = one 16K bank)
 dk_idx   = $B3CE                    ; part index being loaded
+hs_div   = $B3D6                    ; negotiated high-speed AUDF3 index ($01 = none -> stock SIOV)
 
         icl 'src_game/game_atr.inc' ; per-part {sector, count} tables + GAME_FIRST_PART
 
@@ -43,22 +59,8 @@ dk_idx   = $B3CE                    ; part index being loaded
 ;=============================================================================
 .proc read_sectors
         stx rs_cnt
-?lp     lda #$31                    ; D1:
-        sta DDEVIC
-        lda #$01
-        sta DUNIT
-        lda #$52                    ; read sector
-        sta DCOMND
-        lda #$40                    ; receive data
-        sta DSTATS
-        lda #128
-        sta DBYTLO
-        lda #0
-        sta DBYTHI
-        lda #$0F
-        sta DTIMLO
-        jsr SIOV
-        bmi ?err
+?lp     jsr read_one                ; high speed if available, else stock SIOV
+        bcs ?err
         lda DBUFLO                  ; dest += 128
         clc
         adc #128
@@ -75,6 +77,255 @@ dk_idx   = $B3CE                    ; part index being loaded
 ?err    sec
         rts
 rs_cnt  dta 0
+.endp
+
+;-----------------------------------------------------------------------------
+; read_one : read ONE 128-byte sector (DAUX -> DBUF). Uses the negotiated
+;   high-speed divisor when usable; on any high-speed failure it disables HS
+;   for the rest of this load (hs_div<-1) and retries the sector via SIOV.
+;-----------------------------------------------------------------------------
+.proc read_one
+        lda hs_div
+        cmp #$28                    ; >= $28 = 19200 -> no gain, use stock
+        bcs ?std
+        cmp #$02                    ; < 2 -> disabled/invalid, use stock
+        bcc ?std
+        jsr hs_read_sector
+        bcc ?ok
+        lda #$01                    ; HS read failed -> fall back for the rest
+        sta hs_div
+?std    jmp std_read_one
+?ok     clc
+        rts
+.endp
+
+;-----------------------------------------------------------------------------
+; std_read_one : stock OS SIOV read of one 128-byte sector (DAUX -> DBUF).
+;-----------------------------------------------------------------------------
+.proc std_read_one
+        lda #$31
+        sta DDEVIC
+        lda #$01
+        sta DUNIT
+        lda #$52                    ; read sector
+        sta DCOMND
+        lda #$40                    ; receive data
+        sta DSTATS
+        lda #128
+        sta DBYTLO
+        lda #0
+        sta DBYTHI
+        lda #$0F
+        sta DTIMLO
+        jsr SIOV
+        bmi ?err
+        clc
+        rts
+?err    sec
+        rts
+.endp
+
+;-----------------------------------------------------------------------------
+; hs_poll : ask D1: for its high-speed SIO divisor (command $3F). Stores the
+;   POKEY AUDF3 index in hs_div (2..$27 = usable), else $01 (none). Stock SIOV,
+;   one command frame -- negligible vs the part stream. Drives without high
+;   speed NAK $3F -> hs_div=$01 -> everything stays stock (unchanged behaviour).
+;-----------------------------------------------------------------------------
+.proc hs_poll
+        lda #$31
+        sta DDEVIC
+        lda #$01
+        sta DUNIT
+        lda #$3f                    ; poll high-speed index
+        sta DCOMND
+        lda #$40                    ; receive 1 byte
+        sta DSTATS
+        lda #<hs_pbuf
+        sta DBUFLO
+        lda #>hs_pbuf
+        sta DBUFHI
+        lda #1
+        sta DBYTLO
+        lda #0
+        sta DBYTHI
+        lda #$0F
+        sta DTIMLO
+        jsr SIOV
+        bmi ?none
+        lda hs_pbuf
+        cmp #$28                    ; >= 19200 -> no benefit
+        bcs ?none
+        cmp #$02                    ; sub-2 indices: skip (too tight + marker clash)
+        bcc ?none
+        sta hs_div
+        rts
+?none   lda #$01
+        sta hs_div
+        rts
+hs_pbuf dta 0
+.endp
+
+;-----------------------------------------------------------------------------
+; hs_read_sector : read ONE 128-byte sector at the negotiated high-speed
+;   divisor (hs_div), POKEY-level, IRQ-polled. No OS SIO, no ROM patch.
+;   in : DAUX1/2 = sector, DBUFLO/HI = dest
+;   out: C=0 ok / C=1 fail (timeout or bad checksum)
+;   Scratch: ZP $32/$33 = dest ptr, $34 = checksum, $35 = timeout hi.
+;   Fails safe: a wrong/unsupported speed just times out -> C=1 (never hangs).
+;-----------------------------------------------------------------------------
+.proc hs_read_sector
+        lda DBUFLO
+        sta $32
+        lda DBUFHI
+        sta $33
+
+        php
+        sei
+
+        ; POKEY: 16-bit serial clock at the high-speed divisor
+        lda #$28
+        sta p_AUDCTL
+        lda #$a0
+        sta p_AUDC3
+        sta p_AUDC4
+        lda hs_div
+        sta p_AUDF3
+        lda #$00
+        sta p_AUDF4
+
+        ; ---- send command frame: $31 $52 auxlo auxhi chk ----
+        lda #$00
+        sta p_SKCTL
+        sta p_SKRES
+        sta p_IRQEN
+        lda #$23                    ; transmit mode
+        sta p_SKCTL
+        lda #$10
+        sta p_IRQEN                 ; arm SEROR
+
+        lda #$34                    ; assert COMMAND line
+        sta p_PBCTL
+
+        lda #$31                    ; device id = checksum seed
+        sta $34
+        jsr ?send_raw
+        lda #$52                    ; read command
+        jsr ?send_chk
+        lda DAUX1
+        jsr ?send_chk
+        lda DAUX2
+        jsr ?send_chk
+        lda $34                     ; command-frame checksum
+        jsr ?send_raw
+
+        jsr ?wait_txr               ; last byte into the shift register...
+        lda #$08
+        sta p_IRQEN                 ; ...then wait for full transmit-complete
+?txc    lda #$08
+        bit p_IRQST
+        bne ?txc
+
+        lda #$3c                    ; deassert COMMAND line
+        sta p_PBCTL
+
+        ; ---- receive ACK, COMPLETE, 128 data bytes, checksum ----
+        lda #$00
+        sta p_SKCTL
+        sta p_SKRES
+        sta p_IRQEN
+        lda #$13                    ; async receive mode
+        sta p_SKCTL
+        lda #$20
+        sta p_IRQEN                 ; arm SERIN
+
+        jsr ?get                    ; ACK ($41)
+        bcs ?fail
+        cmp #$41
+        bne ?fail
+        jsr ?get                    ; COMPLETE ($43)
+        bcs ?fail
+        cmp #$43
+        bne ?fail
+
+        ldy #$00                    ; 128 data bytes + running checksum
+        sty $34
+?rx     jsr ?get
+        bcs ?fail
+        sta ($32),y
+        clc
+        adc $34
+        adc #$00                    ; end-around carry (Atari SIO checksum)
+        sta $34
+        iny
+        cpy #$80
+        bne ?rx
+
+        jsr ?get                    ; frame checksum
+        bcs ?fail
+        cmp $34
+        bne ?fail
+
+        lda #$13
+        sta p_SKCTL
+        plp
+        clc
+        rts
+
+?fail   lda #$13
+        sta p_SKCTL
+        plp
+        sec
+        rts
+
+?send_chk                           ; send A, fold into checksum $34
+        pha
+        clc
+        adc $34
+        adc #$00
+        sta $34
+        pla
+?send_raw                           ; send A as-is
+        pha
+        jsr ?wait_txr
+        pla
+        sta p_SEROUT
+        rts
+
+?wait_txr                           ; wait serial-output-ready, then reset it
+        lda #$10
+?wl     bit p_IRQST
+        bne ?wl
+        lda #$ef
+        sta p_IRQEN
+        lda #$10
+        sta p_IRQEN
+        rts
+
+?get                                ; receive 1 byte. C=0 ok (A=byte) / C=1 timeout
+        ; The timeout is counted in VBLANKS (RTCLOK3, bumped by the OS VBI, which is
+        ; an NMI and so keeps ticking under our sei), NOT in loop iterations. It used
+        ; to be a 64K-iteration countdown = ~370 ms on a 1.77 MHz 6502 but only ~34 ms
+        ; on a 20 MHz Rapidus -- and the drive needs tens of ms for ACK/COMPLETE. So on
+        ; Rapidus the read bailed mid-frame, read_one immediately issued a fresh command
+        ; while the drive was still transmitting, SIO desynced and the part streamed in
+        ; corrupt. Wall-clock timing makes both CPUs wait the same ~240 ms.
+        lda RTCLOK3
+        adc #11                     ; deadline = now + ~11 ticks (~230 ms); the carry-in
+        tax                         ;   is unknown, so +-1 tick -- irrelevant here.
+?gl     lda #$20                    ;   X is dead across ?get (callers use Y), and ?grdy
+        bit p_IRQST                 ;   reloads it, so the deadline can live there.
+        beq ?grdy
+        cpx RTCLOK3
+        bne ?gl
+        sec
+        rts
+?grdy   ldx #$df                    ; reset SERIN IRQ, read the byte
+        stx p_IRQEN
+        ldx #$20
+        stx p_IRQEN
+        lda p_SERIN
+        clc
+        rts
 .endp
 
 ;=============================================================================
@@ -166,6 +417,7 @@ rs_cnt  dta 0
         sta POKMSK
         sta IRQEN
         cli                         ; SIOV needs the serial IRQ
+        jsr hs_poll                 ; negotiate high-speed SIO once for this load
         ; --- video1 -> banks $14 ---
         ldx dk_idx
         lda atr_v1_sec_lo,x

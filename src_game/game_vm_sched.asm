@@ -9,6 +9,25 @@
 ;   repeat -- until the thread yields or removes itself, then saves its program
 ;   counter so it picks up from there next frame.
 ;
+;   PERF (2026-07-02 fps wave -- see docs/SESSION-2026-07-02-fps-wave.md):
+;     * the opcode fetch is INLINED at vm_fetch (pl_byte's body: bank re-own +
+;       windowed read); the old `jsr pl_byte` + rts cost 12 cyc on EVERY opcode.
+;     * dispatch goes through a 64-entry SPLIT lo/hi table (vm_oplo/vm_ophi,
+;       game_vm_optab.asm) indexed by the opcode DIRECTLY -- no `asl`, no range
+;       check (entries $1B-$3F all point at op_remove, the old bad-PC behaviour).
+;     * the draw opcodes test first ($80+ = draw_bg, $40+ = draw_sprite) and are
+;       TAIL-CALLED (jmp, not jsr) -- do_draw ends with `jmp vm_fetch`.
+;     * vm_cont / vm_goto / vm_rem are GONE: the three slice-ending handlers jump
+;       straight to vm_exit (save the PC, rts) or rts themselves (op_remove), so
+;       every other opcode never pays a slice-end test. op_yield IS vm_exit (the
+;       optab points opcode 6 straight at it).
+;     * vm_maxt ($BA, freed by vm_goto) = watermark: highest thread index ever
+;       installed + 1. The run loop scans only 0..vm_maxt-1 instead of all 64
+;       (AW parts use the low thread slots; typically 5-16 are ever touched).
+;       Raised at the apply scan (?settpc) + snapshot-restore; reset by
+;       vm_reset_threads. Over-scan is harmless, under-scan never happens.
+;   Old cost ~74 cyc dispatch overhead per opcode; new ~53 (-21). Output-identical.
+;
 ;   Part of the game_vm split.
 ;=============================================================================
 
@@ -78,30 +97,32 @@ vm_run_frame
         sta tpc_lo,x
         lda treq_hi,x
         sta tpc_hi,x
+        cpx vm_maxt                 ; raise the run-loop watermark: an install may
+        bcc ?clrreq                 ;   activate a thread above every previous one
+        inx
+        stx vm_maxt                 ; watermark = highest installed index + 1
+        dex
 ?clrreq lda #$FF
         sta treq_lo,x
         sta treq_hi,x
 ?notreq inx
         cpx #64
         bne ?aloop
-?ardone ldx #0                      ; run active threads
+?ardone ldx #0                      ; run active threads (0 .. vm_maxt-1 only)
 ?rloop  lda tpc_hi,x                ; INACTIVE first: the common idle case (only
         cmp #$FF                    ;   ~5-16 of 64 threads are installed) -> the
         beq ?rnext                  ;   cheap test short-circuits the scan
         lda tpause,x
         bne ?rnext
-        txa                         ; save the loop index on the hardware stack --
-        pha                         ; vm_run_thread clobbers vm_s1/vm_s2 (vm_w scratch)
-        jsr vm_run_thread           ; X = thread index
-        pla
-        tax
+        jsr vm_run_thread           ; X = thread index (clobbered; vm_t keeps it)
+        ldx vm_t                    ; restore the loop index (cheaper than pha/pla)
         lda vm_switch               ; a thread asked to switch part -> end the pass now
         bne ?rdone
         lda vm_running
         beq ?rdone                  ; no active threads
 ?rnext  inx
-        cpx #64
-        bne ?rloop
+        cpx vm_maxt                 ; scan only up to the watermark
+        bcc ?rloop
 ?rdone  rts
 
 ;=============================================================================
@@ -109,52 +130,56 @@ vm_run_frame
 ;=============================================================================
 vm_run_thread
         stx vm_t
-        lda tpc_lo,x                ; PC = tpc[X]  (pl_byte's running pointer)
+        lda tpc_lo,x                ; PC = tpc[X]  (the running window pointer)
         sta pl_lo
         lda tpc_hi,x
         sta pl_mid
         jsr set_pl_ptr              ; sync the running window pointer + bank
         lda #0
-        sta vm_goto
-        sta vm_rem
         sta vm_ssp
+; vm_fetch : the opcode fetch + dispatch, fully inlined (the old jsr pl_byte /
+; cmp-chain / word-table sequence cost ~74 cyc; this is ~53). The bank re-own is
+; needed on the OPCODE fetch only: a draw (set_poly_ptr) may have stolen MEMAC-B
+; since the previous opcode; operand fetches inside one opcode use mfetch (no
+; re-own -- the sound IRQ restores the register to memb_cur, which IS pl_bank
+; between the opcode fetch and the first draw).
 vm_fetch
-        jsr pl_byte                 ; A = opcode (re-owns the bank; may follow a draw)
-        cmp #$80
-        bcc ?n80
-        jsr draw_bg
-        jmp vm_fetch
-?n80    cmp #$40
-        bcc ?op
-        jsr draw_sprite
-        jmp vm_fetch
-?op     cmp #27                     ; opcodes 0x00-0x1A valid; >=0x1B = bad PC / garbage
-        bcc *+5                     ; valid -> skip; else halt the thread (never wild-jump)
-        jmp op_remove
-        asl @                       ; opcode * 2 -> jump-table index
-        tay
-        lda vm_optab,y
-        sta vm_disp+1               ; SMC dispatch: patch the jmp operand, then `jmp abs`
-        lda vm_optab+1,y            ;   (3 cyc) vs `jmp (abs)` (5) -> -2 cyc/opcode, and no
-        sta vm_disp+2               ;   vm_jmp RAM cell needed (frees RAMB+93/+94).
+        lda pl_bank                 ; re-own the MEMAC-B bank if a draw took it
+        cmp memb_cur
+        beq ?vfns
+        sta memb_cur
+        sta VBXE_MEMAC_B
+?vfns   ldy #0
+        lda (pl_wlo),y              ; A = opcode byte
+        inc pl_wlo
+        beq ?vfwr                   ; ~1/256 : window page cross
+?vfbk   cmp #$80
+        bcs ?vfbg                   ; $80-$FF -> draw_bg (tail-call; ends jmp vm_fetch)
+        cmp #$40
+        bcs ?vfsp                   ; $40-$7F -> draw_sprite
+        tay                         ; $00-$3F -> split-table dispatch, no range check:
+        lda vm_oplo,y               ;   entries $1B-$3F are op_remove (bad PC/garbage
+        sta vm_disp+1               ;   halts the thread, never wild-jumps)
+        lda vm_ophi,y
+        sta vm_disp+2               ; SMC dispatch: `jmp abs` (3) vs `jmp (abs)` (5)
 vm_disp jmp $FFFF
-; vm_cont / vm_fetch dispatch tail. vm_goto starts 0 (vm_run_thread above) and is
-; set to 1 ONLY by op_yield / op_remove / op_memlist's part-switch -- and once set,
-; the thread always exits here. So for EVERY other opcode (and after a draw) vm_goto
-; is provably 0: those handlers `jmp vm_fetch` directly (3 cyc), skipping this
-; re-read of vm_goto -- saving ~6 cyc/opcode vs routing through vm_cont. Only the
-; three slice-ending handlers `jmp vm_cont`, to save the PC (or skip it if the
-; thread removed itself) and rts back to the scheduler.
-vm_cont
-        lda vm_goto
-        beq vm_fetch
-        lda vm_rem
-        bne ?nosave                 ; removed -> tpc[t] already INACTIVE
+?vfwr   jsr pl_wrap                 ; preserves A (the opcode)
+        jmp ?vfbk
+?vfbg   jmp draw_bg
+?vfsp   jmp draw_sprite
+
+; vm_exit : the slice-end tail -- save the PC, return to the scheduler. Reached
+; ONLY by the slice-ending opcodes: op_yield (the optab maps opcode 6 straight
+; HERE -- yield has no body) and op_memlist's part-switch. op_remove rts's on its
+; own (tpc[t] is already INACTIVE -> nothing to save). Every other handler loops
+; with `jmp vm_fetch` and never pays a slice-end test (the old vm_cont/vm_goto/
+; vm_rem plumbing is gone).
+op_yield                             ; 0x06 : end the thread slice (= vm_exit)
+vm_exit
         jsr vm_save_pc              ; derive the PC from the running pointer (aw3)
         ldx vm_t                    ; save PC = pl_mid:pl_lo -> tpc[t]
         lda pl_lo
         sta tpc_lo,x
         lda pl_mid
         sta tpc_hi,x
-?nosave rts
-
+        rts

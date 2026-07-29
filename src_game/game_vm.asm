@@ -33,7 +33,7 @@
 ;     game_vm_ops2.asm      opcodes 0x0B-0x10 : screen pages, palette, display
 ;     game_vm_ops3.asm      opcodes 0x11-0x1A : thread kill, text, sound, loading
 ;     game_vm_draw.asm      decode a DRAW opcode -> poly_draw
-;     game_vm_optab.asm     the 27-entry jump table the scheduler dispatches through
+;     game_vm_optab.asm     the 64-entry SPLIT lo/hi dispatch tables (fps wave)
 ;=============================================================================
 
 ;-----------------------------------------------------------------------------
@@ -125,8 +125,11 @@ pl_bank  = $B3
 ; zero-page scratch (the $B8-$BD gap, free per aw_equates.inc)
 vm_t     = $B8                      ; current thread index
 vm_ssp   = $B9                      ; call-stack pointer
-vm_goto  = $BA                      ; 1 = thread slice ended
-vm_rem   = $BB                      ; 1 = thread removed itself
+vm_maxt  = $BA                      ; run-loop watermark: highest thread index ever
+                                    ;   installed + 1 (the scheduler scans 0..maxt-1
+                                    ;   only). Was vm_goto -- the slice-end flag is
+                                    ;   gone (handlers exit via vm_exit/rts directly).
+                                    ;   $BB (old vm_rem) is FREE.
 vm_s1    = $BC                      ; word-fetch low / general scratch
 vm_s2    = $BD                      ; word-fetch high / general scratch
 
@@ -143,8 +146,13 @@ vm_b2lo  = RAMB+98                  ; condjmp operand
 vm_b2hi  = RAMB+99
 vm_dstlo = RAMB+100                 ; condjmp destination PC
 vm_dsthi = RAMB+101
-cp_vs    = RAMB+104                 ; copy_page_vs: |VAR_SCROLL_Y| magnitude (rows)
-cp_vd    = RAMB+105                 ; copy_page_vs: 1 = scroll down (offset DST), 0 = up
+; BUGFIX (2026-07-02): cp_vs/cp_vd lived at RAMB+104/+105 -- COLLIDING with
+; awgame.asm's cpu_detail (+104) and rpar (+105)! Every scrolled copypage (the
+; jail/elevator scenes) clobbered cpu_detail, so the next LR part restore
+; (set_render_mode) loaded a garbage detail level into poly_bcb_h (wrong span
+; heights / parity mask). Moved to the free +106/+107 slots (+106..+127 free).
+cp_vs    = RAMB+106                 ; copy_page_vs: |VAR_SCROLL_Y| magnitude (rows)
+cp_vd    = RAMB+107                 ; copy_page_vs: 1 = scroll down (offset DST), 0 = up
 
 ;=============================================================================
 ; vm_init : reset variables, threads, page state.  (Resources are already in VRAM.)
@@ -188,8 +196,13 @@ vm_init
 ; GAME_START_PART : which part the game boots into (default 16002 = water gameplay).
 ; The game GUI's "TEST IN ALTIRRA" patches this line to boot straight into a chosen
 ; scene (water/jail/arene/password/...), then rebuilds the ATR -- like woll3d's menu.
-GAME_START_PART = 16001        ; boot into the INTRO (part 16001); the VM plays it and
-                               ; auto-switches to water (16002) at its end. ESC skips it.
+GAME_START_PART = 16002        ; boot into WATER = actual gameplay. It used to be 16001
+                               ; (the game's own intro part), but on the combined disk the
+                               ; pre-rendered intro with music has ALREADY played by the
+                               ; time the game is entered -- so 16001 replayed the very
+                               ; same cinematic through the VM and looked like "ESC just
+                               ; restarted the intro". 16001 is still reachable via the
+                               ; GUI's scene picker, which patches this line.
         ldx #GAME_START_PART-GAME_FIRST_PART  ; load the start part from the ATR
         jsr load_part
         jsr vm_reset_threads
@@ -233,6 +246,9 @@ vm_reset_threads
         sta tpc_lo
         sta tpc_hi
         sta req_any                 ; all requests are NO_REQ -> nothing pending
+        lda #1
+        sta vm_maxt                 ; only thread 0 is active -> scan 0..0 (the
+                                    ;   apply scan raises this on every install)
         rts
 
 ;=============================================================================
@@ -251,4 +267,4 @@ vm_reset_threads
         icl 'src_game/game_vm_ops2.asm'      ; opcodes 0x0B-0x10 (page / palette / display) + copy_page_vs
         icl 'src_game/game_vm_ops3.asm'      ; opcodes 0x11-0x1A (remove / bitwise / sound / resource)
         icl 'src_game/game_vm_draw.asm'      ; draw_bg, draw_sprite, do_draw
-        icl 'src_game/game_vm_optab.asm'     ; vm_optab jump table
+        icl 'src_game/game_vm_optab.asm'     ; vm_oplo/vm_ophi split dispatch tables

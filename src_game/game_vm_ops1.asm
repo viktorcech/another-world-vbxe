@@ -3,10 +3,11 @@
 ;
 ;   The VM instructions that do maths and control flow: load a constant into a
 ;   variable, copy / add / subtract between the 256 variables, call / return / jump,
-;   yield the thread, install another thread, decrement-and-branch (djnz) and the
-;   signed conditional jump (condjmp). Each handler loops back to the fetch loop in
-;   game_vm_sched.asm -- via `jmp vm_fetch` (these never end the thread slice), EXCEPT
-;   op_yield, which sets vm_goto and uses `jmp vm_cont` (see the note at vm_cont).
+;   install another thread, decrement-and-branch (djnz) and the signed conditional
+;   jump (condjmp). Each handler loops back to the fetch loop in game_vm_sched.asm
+;   via `jmp vm_fetch` (none of these end the thread slice). op_yield lives in
+;   game_vm_sched.asm now: it IS vm_exit (save the PC, rts) -- the old vm_goto /
+;   vm_cont plumbing is gone (2026-07-02 fps wave).
 ;
 ;   The 16-bit operand fetch (m_vm_w) comes from game_vm_fetch.asm, icl'd before
 ;   this. Part of the game_vm split.
@@ -14,7 +15,7 @@
 
 ;=============================================================================
 ; opcode handlers : each loops back with `jmp vm_fetch` (the common "continue"
-; tail), or `jmp vm_cont` for the few that end the thread slice (set vm_goto).
+; tail); the slice-ending ones (yield / remove / memlist) exit via vm_exit / rts.
 ;=============================================================================
 op_movconst                          ; 0x00 : var[b()] = sw()
         mfetch
@@ -91,10 +92,7 @@ op_ret                               ; 0x05 : PC = pop
         jsr set_pl_ptr              ; resync after the PC jump
         jmp vm_fetch
 
-op_yield                             ; 0x06 : end the thread slice
-        lda #1
-        sta vm_goto
-        jmp vm_cont
+; (op_yield -- 0x06 -- is vm_exit in game_vm_sched.asm: the optab points there)
 
 op_jmp                               ; 0x07 : PC = w()
         m_vm_w
@@ -157,7 +155,9 @@ op_condjmp                           ; 0x0A : conditional jump (signed compare)
         lda vm_s2
         sta vm_b2hi
         jmp ?havb
-?byte   jsr pl_byte                 ; b2 = b() (unsigned byte)
+?byte   mfetch                      ; b2 = b() (unsigned byte; mid-opcode -> no
+                                    ;   bank re-own needed, same as the operand
+                                    ;   fetches above -- was `jsr pl_byte`)
         sta vm_b2lo
         lda #0
         sta vm_b2hi

@@ -15,13 +15,6 @@
         dta a($0700)            ; load address
         dta a(boot_init)        ; init address (jump here after load)
 
-; === Variables ===
-cur_sec     dta a(4)            ; current sector number (XEX starts at 4)
-buf_pos     dta 128             ; position in buffer (128 = force first read)
-seg_lo      dta 0
-seg_hi      dta 0
-end_lo      dta 0
-end_hi      dta 0
 
 ; Zero page pointer for indirect store (must be in ZP)
 zp_dest     = $E0              ; 2 bytes: destination pointer (free ZP area)
@@ -153,3 +146,11 @@ read_sec
 ?done   lda #0
         sta buf_pos
         rts
+
+; === Variables ===
+cur_sec     dta a(4)            ; current sector number (XEX starts at 4)
+buf_pos     dta 128             ; position in buffer (128 = force first read)
+seg_lo      dta 0
+seg_hi      dta 0
+end_lo      dta 0
+end_hi      dta 0

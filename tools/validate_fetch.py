@@ -155,9 +155,11 @@ while p < len(pl):
     ops += 1
     if op == 0x00:
         break
-    elif op == 0x01 or op == 0x02 or op == 0x08:       # setpal / selpage / sound
+    elif op == 0x01 or op == 0x02:                     # setpal / selpage
         pl_byte(p); p += 1
-    elif op == 0x03 or op == 0x04 or op == 0x06:       # fill / copy / blit
+    elif op == 0x09:                                   # music start: no operands
+        pass
+    elif op == 0x03 or op == 0x04 or op == 0x06 or op == 0x08:   # fill/copy/blit/sound
         pl_byte(p); pl_byte(p + 1); p += 2
     elif op == 0x07:                                   # drawtext: 5 operand bytes
         for i in range(5):

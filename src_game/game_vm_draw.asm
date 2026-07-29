@@ -97,7 +97,7 @@ draw_sprite
         and #$10
         beq ?xdone
         inc dr_x+1
-?xdone  jsr pl_byte                 ; y = b()
+?xdone  mfetch                      ; y = b()  (mid-opcode -> mfetch, no bank re-own)
         sta dr_y
         lda #0
         sta dr_y+1
@@ -141,7 +141,7 @@ draw_sprite
         lda #8                      ; use video2 (shared shapes)
         sta poly_base_adj
         jmp ?zdone
-?zbyte  jsr pl_byte                 ; zoom = b()
+?zbyte  mfetch                      ; zoom = b()  (mid-opcode -> mfetch)
         sta dr_zoom
         lda #0
         sta dr_zoom+1
@@ -196,5 +196,6 @@ do_draw
         lda poly_bcb_h              ; 0 = 1-tall spans (full) ; 1 = 2-tall (half-res, stock)
         sta BCB+BCB_HEIGHT
         jsr poly_draw
-?dddone rts
+?dddone jmp vm_fetch                ; tail: the draw opcodes are TAIL-CALLED from
+                                    ;   vm_fetch (jmp, not jsr) -> loop straight back
 

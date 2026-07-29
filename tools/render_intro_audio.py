@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
-"""render_intro_audio.py - render the WHOLE intro soundtrack (AW music #7 + all
-SFX) to ONE mono stream, mixed offline on the PC at the intro's exact timeline.
+"""render_intro_audio.py - render AW music #7 (MUSIC ONLY, no SFX baked in) to
+one mono 4-bit POKEY stream for the intro's second sample voice.
 
-Why offline: the intro is fully deterministic (the flattened playlist fixes every
-sound's time), so we can pre-mix music+SFX into a single mono 4-bit stream and let
-the existing 1-voice POKEY player replay it -- no runtime multi-voice mixing.
+History: the first attempt PRE-MIXED music+SFX into one stream; it was removed
+because the baked SFX drifted against the deadline-paced visuals (renders that
+overrun stretch the visual timeline while audio runs at a fixed ~3995 Hz). Now
+the stream carries the music alone and FREE-RUNS on AUDC2 (drift is harmless
+for background music); SFX stay discrete playlist events on AUDC4, so they
+keep exact sync. See memory intro-sound-scope.
 
-Timeline: run the intro VM (aw_sim), stamp every op_music/op_sound by the display-
-frame counter; frame -> seconds via the per-frame hold (VAR_PAUSE_SLICES / frameHz).
-Music #7 is rendered with the AW SfxPlayer model (4 sample voices, Amiga period ->
-freq = kPaulaFreq/(period*2), tempo = delay rows). SFX are mixed in at their event
-times at getSoundFreq(freq).
+Timeline: run the intro VM (aw_sim), find the music segment using the rawgl
+op_music semantics (res!=0 = start, its delay overrides the module tempo;
+res==0 && delay!=0 = TEMPO CHANGE mid-piece; res==0 && delay==0 = stop --
+_rawgl_script.cpp snd_playMusic). The intro plays #7 for ~117 s with one
+tempo change at ~45 s; treating the tempo change as a stop was the old "music
+is short" bug. Frame -> seconds via the per-frame hold (VAR_PAUSE_SLICES /
+frameHz). Music #7 is rendered with the AW SfxPlayer model (4 sample voices,
+Amiga period -> freq = kPaulaFreq/(period*2), tempo = delay rows), then
+downsampled to HALF the POKEY tick rate (the 6502 voice advances every other
+Timer-1 tick: 117 s @ 3995 Hz = 234 KB would not fit the free VRAM banks;
+@ ~1998 Hz it is ~118 KB in 8 banks) and packed to 4-bit nibbles.
 
-Outputs:  out/audio/intro_soundtrack.wav  (audition)
-          out/audio/intro_soundtrack_4bit.bin  (POKEY 4-bit packed, for VRAM)
+Outputs:  out/intro_music.bin        (POKEY 4-bit packed, streamed to VRAM)
+          out/audio/intro_music.wav  (audition)
+          src/aw_music_len.inc       (MUSIC_LEN for the 6502 player)
 """
 import os, sys, struct, wave
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -23,7 +33,8 @@ import aw_pack, aw_sim
 OUT = os.path.join(os.path.dirname(HERE), 'out', 'audio')   # WAV audition lives here
 OUT_ROOT = os.path.join(os.path.dirname(HERE), 'out')        # .bin/.json the build reads
 RATE = 22050                     # PC mix rate (downsampled to the POKEY rate at the end)
-POKEY_RATE = 3995                # AUDF1=15 playback rate on the Atari
+POKEY_RATE = 3995                # AUDF1=15 Timer-1 tick rate on the Atari
+MUS_RATE = POKEY_RATE / 2        # the music voice advances every OTHER tick
 FRAME_HZ = 50                    # PAL pacing (the intro runs at VAR_PAUSE_SLICES/50 s)
 kPaulaFreq = 7159092
 MUSIC_RES = 7
@@ -55,10 +66,13 @@ def load_sound(byid, rid):
     return sound_pcm_signed(data)
 
 
-def render_music(buf, t_start, t_stop, byid):
-    """Render AW music #7 into buf[] (float, RATE) over [t_start, t_stop) seconds."""
+def render_music(buf, t_start, t_stop, byid, tempo=None):
+    """Render AW music #7 into buf[] (float, RATE) over [t_start, t_stop) seconds.
+    tempo = [(t_rel_seconds, delay), ...] -- the op_music tempo timeline (a delay
+    of 0/None means the module's default). rawgl SfxPlayer: delay -> ms per row
+    = delay*60/7050."""
     data, _ = aw_pack.load_resource(byid[MUSIC_RES])
-    delay = be16(data, 0)
+    delay_def = be16(data, 0)
     numorder = be16(data, 0x3E)
     order = list(data[0x40:0x40 + numorder])
     # 15 instruments: {resId, volume}
@@ -66,8 +80,12 @@ def render_music(buf, t_start, t_stop, byid):
     for i in range(15):
         rid = be16(data, 2 + i * 4); vol = be16(data, 2 + i * 4 + 2)
         inst.append((rid, vol, load_sound(byid, rid) if rid else None))
-    # AW SfxPlayer tempo: delay -> ms per row (rawgl: delay*60/7050), then -> samples.
-    samples_per_row = max(1, int(round((delay * 60 / 7050) * RATE / 1000.0)))
+
+    def spr(delay):
+        return max(1, int(round(((delay or delay_def) * 60 / 7050) * RATE / 1000.0)))
+    tempo_ev = [(tt, spr(d)) for tt, d in (tempo or [(0.0, None)])]
+    samples_per_row = tempo_ev[0][1]
+    next_te = 1
     patbase = 0xC0
     # 4 channels: each {smp(floats), pos, inc, vol(0..63), loop_start, loop_len, on}
     ch = [dict(smp=None, pos=0.0, inc=0.0, vol=0, ls=None, ll=0, on=False) for _ in range(4)]
@@ -101,6 +119,8 @@ def render_music(buf, t_start, t_stop, byid):
     curorder, curpos, rowctr = 0, 0, 0
     handle_row(curorder, curpos)
     for i in range(i0, i1):
+        if next_te < len(tempo_ev) and (i - i0) >= int(tempo_ev[next_te][0] * RATE):
+            samples_per_row = tempo_ev[next_te][1]; next_te += 1
         acc = 0.0
         for c in ch:
             if not c['on'] or c['smp'] is None:
@@ -127,22 +147,8 @@ def render_music(buf, t_start, t_stop, byid):
             handle_row(curorder, curpos)
 
 
-def render_sfx(buf, t, freq_byte, vol, smp):
-    if smp is None:
-        return
-    f, ls, ll = smp
-    rate = kPaulaFreq / (PERIOD_TABLE[min(39, freq_byte)] * 2)
-    inc = rate / RATE
-    pos = 0.0; i = int(t * RATE); g = vol / 63.0
-    n = len(buf)
-    while i < n:
-        if pos >= len(f):
-            if ll > 0: pos = ls + ((pos - ls) % ll)
-            else: break
-        buf[i] += f[int(pos)] * g
-        pos += inc; i += 1
-        if pos >= len(f) and ll == 0:
-            break
+MUSIC_VRAM_BANKS = 8           # banks $02,$03,$06,$07,$0A,$0B,$11,$12 (aw_data.asm
+                               # chunks + mus_banks in aw_sound.asm, in this order)
 
 
 def main():
@@ -166,36 +172,36 @@ def main():
     def ftime(f): return tstart[min(f, len(holds))]
     total = tstart[-1]
 
-    # The MUSIC plays only the first segment: the first op_music(res #7) until the
-    # next op_music (a stop). We pre-mix ONLY that segment (music + the SFX that fall
-    # inside it) into one stream; SFX after it stay discrete (aw_playlist 0x08).
-    mus = [(ftime(f), r, f) for (f, k, r, *_ ) in events if k == 'mus']
-    t0 = next((t for t, r, f in mus if r == MUSIC_RES), 0.0)
-    after = [t for t, r, f in mus if t > t0]
-    t_stop = min(after) if after else total
-    seg_end_frame = next((f for tt, r, f in mus if tt == t_stop), len(holds))
+    # Music segment via the rawgl op_music semantics (snd_playMusic): res!=0 =
+    # START (delay overrides the module tempo when nonzero); res==0 && delay!=0
+    # = TEMPO CHANGE; res==0 && delay==0 = STOP. MUSIC ONLY -- no SFX baked in:
+    # the stream free-runs on its own POKEY channel while SFX stay discrete
+    # playlist events (0x08).
+    mus = [(ftime(f), f, r, d) for (f, k, r, d, p) in events if k == 'mus']
+    start = next(((t, f, d) for t, f, r, d in mus if r == MUSIC_RES), None)
+    if start is None:
+        sys.exit('ERROR: no op_music start event found in the intro trace')
+    t0, f0, delay0 = start
+    tempo = [(0.0, delay0)]                    # buf-relative tempo timeline
+    t_stop, seg_end_frame = total, len(holds)
+    for t, f, r, d in mus:
+        if t <= t0 or r != 0:
+            continue
+        if d:
+            tempo.append((t - t0, d))          # tempo change, the music keeps playing
+        else:
+            t_stop, seg_end_frame = t, f       # the real stop
+            break
 
     seg_len = t_stop - t0
     buf = [0.0] * int(seg_len * RATE + RATE)
-    render_music(buf, 0.0, seg_len, byid)      # music from the segment start (buf-relative)
+    render_music(buf, 0.0, seg_len, byid, tempo)   # music from the segment start
 
-    sfx_cache = {}
-    nsfx = 0
-    for (f, k, r, a, b) in events:
-        if k != 'snd':
-            continue
-        et = ftime(f)
-        if not (t0 <= et < t_stop):            # only SFX inside the music segment
-            continue
-        if r not in sfx_cache:
-            sfx_cache[r] = load_sound(byid, r)
-        render_sfx(buf, et - t0, a, b, sfx_cache[r])
-        nsfx += 1
-
-    # normalize, downsample RATE -> POKEY_RATE, quantize to 4-bit, pack hi/lo
+    # normalize, downsample RATE -> MUS_RATE (half a tick rate: the 6502 voice
+    # advances every other Timer-1 IRQ), quantize to 4-bit, pack hi/lo
     peak = max((abs(x) for x in buf), default=1.0) or 1.0
     g = 0.95 / peak
-    step = RATE / POKEY_RATE
+    step = RATE / MUS_RATE
     n_out = int(len(buf) / step)
     q = []
     for i in range(n_out):
@@ -206,22 +212,27 @@ def main():
         q.append(8)
     packed = bytes((q[i] << 4) | q[i + 1] for i in range(0, len(q), 2))
 
+    cap = MUSIC_VRAM_BANKS * 0x4000
+    if len(packed) > cap:
+        sys.exit(f'ERROR: music stream {len(packed)} B > {cap} B '
+                 f'({MUSIC_VRAM_BANKS} VRAM gap banks) -- extend mus_banks in '
+                 f'aw_sound.asm + the chunks in aw_data.asm first')
+
     os.makedirs(OUT, exist_ok=True)
     open(os.path.join(OUT_ROOT, 'intro_music.bin'), 'wb').write(packed)   # streamed to VRAM
     with wave.open(os.path.join(OUT, 'intro_music.wav'), 'wb') as w:
-        w.setnchannels(1); w.setsampwidth(1); w.setframerate(POKEY_RATE)
+        w.setnchannels(1); w.setsampwidth(1); w.setframerate(int(round(MUS_RATE)))
         w.writeframes(bytes((v << 4) | 0x08 for v in q))
-    # length (bytes) + the frame where the music segment ends (aw_playlist suppresses
-    # discrete SFX before it -- they are baked into this stream).
+    # length (bytes) for the 6502 player's 24-bit countdown; the meta json is
+    # informational only (nothing suppresses SFX any more -- they play discrete).
     inc = os.path.join(os.path.dirname(HERE), 'src', 'aw_music_len.inc')
     open(inc, 'w').write(f'; auto-generated by render_intro_audio.py\nMUSIC_LEN = {len(packed)}\n')
     open(os.path.join(OUT_ROOT, 'intro_music_meta.json'), 'w').write(
         f'{{"seg_end_frame": {seg_end_frame}, "bytes": {len(packed)}}}')
 
     print(f"intro total    : {total:6.1f} s ; music segment: {seg_len:5.1f} s "
-          f"(frames {next((f for _,r,f in mus if r==MUSIC_RES),0)}..{seg_end_frame})")
-    print(f"sfx in segment : {nsfx} (baked in) ; rest stay discrete")
-    print(f"music stream @ {POKEY_RATE} Hz 4-bit: {len(packed)} bytes "
+          f"(frames {f0}..{seg_end_frame}, {len(tempo)-1} tempo change(s))")
+    print(f"music stream @ {MUS_RATE:.1f} Hz 4-bit: {len(packed)} bytes "
           f"({len(packed)/1024:.1f} KB, {(len(packed)+0x3FFF)>>14} VRAM banks)")
     print(f"  out/audio/intro_music.wav + intro_music.bin, src/aw_music_len.inc")
 

@@ -226,9 +226,11 @@ class Sim:
                 str_id = self.u16(); x = self.u8(); y = self.u8(); col = self.u8()
                 self.draw_text(str_id, x, y, col)
             elif op == 0x08:
-                self.u8()                       # SOUND idx (1 byte) -- no audio in the sim,
-                                                # but the operand MUST be consumed or the
-                                                # playlist stream desyncs (was: 5 frames only)
+                self.u8(); self.u8()            # SOUND idx,vol (2 bytes) -- no audio in the
+                                                # sim, but the operands MUST be consumed or
+                                                # the playlist stream desyncs (was: 5 frames)
+            elif op == 0x09:
+                pass                            # MUSIC start -- no operands, no audio in the sim
             elif op == 0x06:
                 pg = self.u8(); hold = self.u8()
                 self.frames.append((bytes(self.pages[pg]), self.curpal))

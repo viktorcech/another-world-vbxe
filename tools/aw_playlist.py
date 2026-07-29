@@ -20,6 +20,8 @@ Command stream (little-endian, 6502-friendly):
   0x04 COPYPAGE src(1) dst(1)
   0x05 DRAWPOLY off(2) x(2) y(2) zoom(2)      off = byte offset into poly data
   0x06 BLIT     page(1) hold(1)               display page; hold = host-frames
+  0x08 SOUND    idx(1) vol(1)                 idx = pitch-baked variant, vol 0..63
+  0x09 MUSIC    (no operands)                 start the free-running music stream
 Pages are physical 0..3 (the VM's 0xFE/0xFF are already resolved). Coordinates
 are in native 320-wide AW space; the LR (160) build halves x when drawing.
 """
@@ -31,13 +33,16 @@ import aw_sim
 OUT = os.path.join(os.path.dirname(HERE), 'out')
 
 OPC = {'pal': 0x01, 'sel': 0x02, 'fill': 0x03, 'copy': 0x04,
-       'poly': 0x05, 'blit': 0x06, 'text': 0x07, 'snd': 0x08}
+       'poly': 0x05, 'blit': 0x06, 'text': 0x07, 'snd': 0x08, 'mus': 0x09}
 
-# resId -> sfx index (gen_intro_sfx.py); only these sounds are shipped to VRAM.
+MUSIC_RES = 7                  # the intro's one tracker module (render_intro_audio.py)
+
+# "res,freq" -> pitch-baked variant index (gen_intro_sfx.py); combos not in
+# the map are dropped (only res 0x34, an empty placeholder in the source data).
 def _sfx_map():
     p = os.path.join(OUT, 'intro_sfx_map.json')
     if os.path.exists(p):
-        return {int(k): v for k, v in json.load(open(p)).items()}
+        return json.load(open(p))
     return {}
 
 
@@ -54,13 +59,22 @@ def s16(v):
 def serialize(events):
     sfxmap = _sfx_map()
     out = bytearray()
+    music_started = False
     for e in events:
         k = e[0]
+        if k == 'mus':
+            # only the FIRST start of the intro module becomes an opcode; the
+            # later op_music (the stop) is dropped -- the 6502 stream is exactly
+            # the segment long and ends by its own byte count (free-run design).
+            if e[1] == MUSIC_RES and not music_started:
+                out.append(OPC['mus'])
+                music_started = True
+            continue
         if k == 'snd':
-            idx = sfxmap.get(e[1])     # e = ('snd', resId, freq, vol, ch)
+            idx = sfxmap.get(f'{e[1]},{min(39, e[2])}')   # e = ('snd', res, freq, vol, ch)
             if idx is None:
-                continue               # sound not shipped -> drop the event
-            out += bytes((OPC['snd'], idx & 0xFF))
+                continue               # variant not shipped -> drop the event
+            out += bytes((OPC['snd'], idx & 0xFF, e[3] & 0x3F))
             continue
         out.append(OPC[k])
         if k == 'pal':
@@ -117,7 +131,7 @@ def main():
     c = Counter(e[0] for e in vm.events)
     print(f'frames (BLIT)  : {c.get("blit",0)}')
     print(f'events total   : {len(vm.events)}')
-    for k in ('pal', 'sel', 'fill', 'copy', 'poly', 'blit', 'text', 'snd'):
+    for k in ('pal', 'sel', 'fill', 'copy', 'poly', 'blit', 'text', 'snd', 'mus'):
         print(f'  {k:5}: {c.get(k,0)}')
     print(f'playlist bytes : {len(blob)}  -> out/intro_playlist.bin')
     print(f'poly data      : {os.path.getsize(os.path.join(OUT,"intro_poly.bin"))} '
