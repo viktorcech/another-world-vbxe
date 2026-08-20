@@ -41,11 +41,12 @@ nv_msg  dta c'VBXE NOT DETECTED!',$9B
 nv_len  equ *-nv_msg
 
 ; intro finished OR ESC pressed.
-;   Full-disk build (-d:GAME_SEC, build_full.ps1): hand control back to the
-;   RESIDENT boot loader ($0700, src_game/bootloader.asm -- it survives the
-;   whole intro), pointed at the game's first sector -> chain-loads awgame.xex.
-;   Standalone build (build_intro.ps1, no GAME_SEC): restore the OS screen and
-;   return to DOS as before.
+;   Disk build (build.ps1 -- it passes -d:GAME_SEC on BOTH passes): hand control
+;   back to the RESIDENT boot loader ($0700, src_game/bootloader.asm -- it
+;   survives the whole intro), pointed at the game's first sector -> chain-loads
+;   awgame.xex.
+;   Assembled by hand with no GAME_SEC define: restore the OS screen and return
+;   to DOS, i.e. awintro.xex stands on its own.
 ; src_game/bootloader.asm symbol addresses. These MUST match the assembled loader.
 ; The Atari boot protocol jumps to load_address+6, so $0706 is boot_init's CODE and
 ; the variables live at the END of the loader. An earlier revision of these three

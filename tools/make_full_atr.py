@@ -14,12 +14,12 @@ $070D with cur_sec = GAME_SEC, so the SAME loader parses awgame.xex and JMPs int
 the game. The game then streams its parts from `base` via src_game/game_atr.inc.
 
 GAME_SEC = 4 + intro_sectors, and the game's part table was regenerated with
-base = GAME_SEC + game_xex_sectors -- both set up by build_full.ps1 BEFORE this
+base = GAME_SEC + game_xex_sectors -- both set up by build.ps1 BEFORE this
 script runs. This script only concatenates the pieces and writes the ATR header;
 it re-derives GAME_SEC/base from the file sizes and prints the map so the layout
 can be eyeballed against the build log.
 
-Run from the project root (via build_full.ps1):  python tools/make_full_atr.py
+Run from the project root (via build.ps1):  python tools/make_full_atr.py
 """
 import os, re, struct, sys
 
@@ -42,7 +42,7 @@ def secs(n):
 def main():
     for p in (BOOT, INTRO, GAME, BLOB):
         if not os.path.exists(p):
-            sys.exit(f"missing {p} -- run build_full.ps1 (it builds every piece first)")
+            sys.exit(f"missing {p} -- run build.ps1 (it builds every piece first)")
 
     boot = open(BOOT, "rb").read()
     if len(boot) > 3 * SECTOR:

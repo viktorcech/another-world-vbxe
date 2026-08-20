@@ -41,9 +41,9 @@ SHOTS = os.path.join(PROJ, 'out', 'shots')
 SCREENS_DIR = os.path.join(PROJ, 'out', 'screens')      # auto-archived screen PNGs
 ASM = os.path.join(PROJ, 'src_game', 'awgame.asm')
 XEX = os.path.join(PROJ, 'awgame.xex')
-ATR = os.path.join(PROJ, 'awgame.atr')                  # the game needs the ATR on D1:
+ATR = os.path.join(PROJ, 'awgame_full.atr')             # the game needs the ATR on D1:
 GAME_VM = os.path.join(PROJ, 'src_game', 'game_vm.asm')  # holds GAME_START_PART
-BUILD_PS1 = os.path.join(PROJ, 'build_awgame.ps1')       # 2-pass ATR build + guard
+BUILD_PS1 = os.path.join(PROJ, 'build.ps1')              # THE build: intro + game + guards
 
 
 def set_start_part(part):
@@ -451,7 +451,12 @@ def main():
     def build_and_run():
         """TEST IN ALTIRRA: build the ATR booting straight into the SELECTED scene,
         then launch Altirra with it on D1: (woll3d pattern). The game streams its
-        parts from the ATR, so we boot the .atr (not the bare .xex)."""
+        parts from the ATR, so we boot the .atr (not the bare .xex).
+        build.ps1 makes ONE disk -- awgame_full.atr -- and the intro is in front of
+        the game on it, so press ESC to chain into the scene you picked. Building
+        a standalone awgame.atr instead is NOT an option: make_game_atr.py would
+        rewrite src_game/game_atr.inc for a different disk layout and leave the
+        tree pointing at the wrong sectors."""
         if not MADS:
             set_status('mads.exe not found in project root', ok=False); return
         if not altirra[0]:
@@ -490,7 +495,7 @@ def main():
             set_status('BUILD FAILED (see console)', ok=False)
             print(r.stdout, r.stderr); return
         try:
-            subprocess.Popen([altirra[0], ATR])           # mount awgame.atr as D1: + boot
+            subprocess.Popen([altirra[0], ATR])           # mount the full disk as D1: + boot
             set_status(f'launched Altirra -> {tgt}')
         except OSError as e:
             set_status(f'launch failed: {e}', ok=False)
