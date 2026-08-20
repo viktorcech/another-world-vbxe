@@ -233,6 +233,7 @@ gtxt_ptr = cr0                       ; $C0-$C1 : string byte ptr (txt_ptr collid
 LD_COL  = 1                          ; text colour index (forced white below)
 LD_X    = 15                         ; start column (40 cols of 8 px) -> "LOADING..." centred
 LD_Y    = 96                         ; row in px (200-tall page)
+LD_HOLD = 50                         ; vblanks the screen is held (~1 s PAL / 0.8 s NTSC)
 
 .proc draw_loading
         lda #1                       ; pal #1: idx0 = black bg, idx1 = white text
@@ -291,15 +292,23 @@ LD_Y    = 96                         ; row in px (200-tall page)
 ?done   jsr blit_idle                ; let the last glyph land before we show the page
         lda vm_cur2
         jsr show_page                ; re-assert the displayed page (now the LOADING screen)
-        ; Keep it up for at least ~0.5 s. Otherwise the screen lives exactly as long as
-        ; the SIO read that follows, and that varies wildly: booted as a bare xex the
-        ; read fails and retries (screen stays for seconds), off the real disk it
-        ; succeeds so fast that the scene replaced it before it could be read at all.
-        ; X is dead here -- load_part reloads it from dk_idx right after this call.
+        ; Hold it. Without this the screen lives exactly as long as the SIO read that
+        ; follows, and that varies wildly: booted as a bare xex the read fails and
+        ; retries (screen stays for seconds), off the real disk it succeeds so fast
+        ; that the scene replaced it before it could be read at all. The ESC-into-game
+        ; path was already legible at ~25 frames; the FIRST load (chained straight out
+        ; of the intro) was not, so the hold is a full second now.
+        ;   Counts VBI TICKS instead of waiting for RTCLOK3 to hit one exact value:
+        ;   equality is a single-shot target, so a tick observed late leaves the loop
+        ;   spinning a further ~5 s for the counter to wrap all the way round.
+        ;   RTCLOK3 is bumped by the OS VBI, which is an NMI -- it keeps ticking under
+        ;   load_part's sei. X is dead here (load_part reloads it from dk_idx).
+        ldx #LD_HOLD
         lda RTCLOK3
-        adc #25                      ; deadline = now + ~25 vblanks (carry-in -> +-1)
-        tax
-?hold   cpx RTCLOK3
+?hold   cmp RTCLOK3
+        beq ?hold                    ; same jiffy -> wait for the next VBI
+        lda RTCLOK3                  ; re-latch: one tick counted
+        dex
         bne ?hold
         rts
 ld_str  dta c'LOADING...',0

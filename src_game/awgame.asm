@@ -215,6 +215,9 @@ disable_basic
         org $B400
         icl 'src_game/game_diskio.asm' ; runtime ATR part loader (Phase 2)
         icl 'src_game/game_sound.asm'  ; POKEY SFX player (op_sound) -- per-part VRAM samples
+        ert *>$C000                    ; $C000 = OS ROM. mads would happily emit a segment
+                                       ;   ON TOP of it and the loader would write into
+                                       ;   nothing -- this block is known to be near full.
 
 ; game_text RELOCATED to $0900 (its own segment): the $B400-$BFFF block filled up (ceiling
 ; is $C000 = OS ROM), so DRAWTEXT could not grow there. $0900-$0FFF is free at RUN time --

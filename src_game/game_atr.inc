@@ -2,16 +2,16 @@
 ; part index order: 16000, 16001, 16002, 16003, 16004, 16005, 16006, 16007, 16008
 GAME_NPARTS = 9
 GAME_FIRST_PART = 16000
-GAME_BLOB_BASE = 3036
+GAME_BLOB_BASE = 3045
 
 atr_pal_sec_lo
-        dta 220,51,139,193,109,37,87,177,54
+        dta 229,60,148,202,118,46,96,186,63
 atr_pal_sec_hi
         dta 11,12,14,17,21,26,27,31,33
 atr_pal_cnt
         dta 12,12,12,12,12,12,12,12,12
 atr_code_sec_lo
-        dta 232,63,151,205,121,49,99,189,66
+        dta 241,72,160,214,130,58,108,198,75
 atr_code_sec_hi
         dta 11,12,14,17,21,26,27,31,33
 atr_code_cnt_lo
@@ -19,7 +19,7 @@ atr_code_cnt_lo
 atr_code_cnt_hi
         dta 0,0,0,1,1,0,1,0,0
 atr_v1_sec_lo
-        dta 10,141,58,4,99,114,240,212,100
+        dta 19,150,67,13,108,123,249,221,109
 atr_v1_sec_hi
         dta 12,12,15,19,23,26,28,31,33
 atr_v1_cnt_lo
@@ -27,9 +27,9 @@ atr_v1_cnt_lo
 atr_v1_cnt_hi
         dta 0,1,1,1,1,0,1,0,0
 atr_v2_sec_lo
-        dta 0,0,252,168,96,0,236,113,0
+        dta 0,0,5,177,105,0,245,122,0
 atr_v2_sec_hi
-        dta 0,0,16,20,25,0,30,32,0
+        dta 0,0,17,20,25,0,30,32,0
 atr_v2_cnt_lo
         dta 0,0,197,197,197,0,197,197,0
 atr_v2_cnt_hi
@@ -41,7 +41,7 @@ atr_bmp_num_lo
 atr_bmp_num_hi
         dta 0,0,0,0,0,0,0,0,0,0,0,0
 atr_bmp_sec_lo
-        dta 140,134,128,122,116,110,104,98,92,86,80,74
+        dta 149,143,137,131,125,119,113,107,101,95,89,83
 atr_bmp_sec_hi
         dta 33,34,35,36,37,38,39,40,41,42,43,44
 atr_bmp_cnt
@@ -50,7 +50,7 @@ atr_bmp_cnt
 SND_NBANK = 7
 snd_blist   dta $8E,$8F,$91,$92,$93,$9E,$9F
 atr_snd_sec_lo
-        dta 0,68,0,177,209,10,30,138,0
+        dta 0,77,9,186,218,19,39,147,0
 atr_snd_sec_hi
         dta 0,45,48,50,53,57,60,63,0
 atr_snd_cnt_lo
