@@ -85,6 +85,13 @@ start
                                     ;   snd_init -- the sound IRQ restores MEMAC_B
                                     ;   to memb_cur and would yank the bank mid-write)
 
+        jsr snd_settings            ; pre-intro menu: POKEY 4-bit or COVOX 8-bit at
+                                    ;   $D280/$D500/$D600/$D700. MUST come before
+                                    ;   snd_init -- snd_go_covox patches the VIMIRQ
+                                    ;   immediates that snd_init itself writes, so a
+                                    ;   mode chosen after the hook would never reach
+                                    ;   the DAC (aw_settings.asm)
+
         jsr snd_init                ; POKEY SFX player : hook Timer 1 IRQ (loading done)
 
 .if DIAG

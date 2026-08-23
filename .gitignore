@@ -16,6 +16,9 @@ mads.exe
 __pycache__/
 *.pyc
 
+# generated at every build (version + build timestamp, build.ps1)
+/src/aw_version.inc
+
 # backups / scratch
 *.bak
 /_zal/

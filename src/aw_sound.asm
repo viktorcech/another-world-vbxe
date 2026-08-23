@@ -159,6 +159,23 @@ mus_banks    dta $82,$83,$86,$87,$8A,$8B,$91,$92
                                      ;   (32 KB each) + the orphaned COVOX banks
                                      ;   $11,$12 -- NOT contiguous
 
+; The output mode, as answered by the pre-intro menu (aw_settings.asm):
+;   $FF  nobody asked  -> probe $D280 like every earlier build did
+;   $00  POKEY 4-bit   -> the code assembled in place IS this mode
+;   1..4 COVOX at cv_blo/cv_bhi[A-1] = $D280 / $D500 / $D600 / $D700
+snd_mode     dta $FF
+
+; Handoff to the GAME. The game is a separate xex that the boot loader chain-
+; loads OVER this one (aw_exit.asm), so the menu's answer has to survive in RAM
+; the loader does not touch: page 4 is free in both builds (nothing in either xex
+; loads there, the loader's own sector buffer is $0800, and no DOS is resident).
+; The magic byte is what tells a chosen $00 (POKEY) apart from cold-start RAM --
+; without it the game would auto-probe and could switch to covox behind a user
+; who deliberately asked for POKEY.
+CFG_MAGIC = $04FE                    ; $A7 = the two bytes were written by us
+CFG_MODE  = $04FF                    ; a copy of snd_mode
+CFG_OK    = $A7
+
 ;-----------------------------------------------------------------------------
 snd_init
         lda #0
@@ -179,14 +196,17 @@ snd_init
         sta snd_active
         sta zmus_st
 .ifdef COVOX_FORCE
-        jsr snd_go_covox             ; TEST BUILD (build.ps1 -ForceCovox): skip the
-                                     ;   probe and go 8-bit unconditionally. POKEY is
-                                     ;   then never written, so pulling the Covox
-                                     ;   device in Altirra must give SILENCE -- which
-                                     ;   is what proves the covox path is the one
-                                     ;   actually making the sound.
+        lda snd_mode                 ; TEST BUILD (build.ps1 -ForceCovox): skip the
+        bmi ?d280                    ;   probe and go 8-bit unconditionally. POKEY is
+        bne ?have                    ;   then never written, so pulling the Covox
+?d280   lda #1                       ;   device in Altirra must give SILENCE -- which
+?have   sec                          ;   is what proves the covox path is the one
+        sbc #1                       ;   actually making the sound. A menu choice
+        jsr cv_set_base              ;   still picks the BASE; "POKEY" and "nobody
+        jsr snd_go_covox             ;   asked" both fall back to $D280.
 .else
-        jsr snd_detect               ; -> 8-bit covox output if one answers
+        lda snd_mode                 ; the menu's answer, or $FF -> probe $D280
+        jsr snd_apply                ;   -> 8-bit covox output if one answers
 .endif
         jsr snd_mute                 ; park both voices (covox: DAC to mid rail)
         sei
@@ -200,6 +220,23 @@ vi2     lda #>snd_irq
         sta VIMIRQ+1
         cli
         rts
+
+;-----------------------------------------------------------------------------
+; snd_apply : install the output mode in A ($FF auto / 0 POKEY / 1..4 covox base
+;   index+1). MUST run from snd_init and nowhere else: snd_go_covox patches the
+;   VIMIRQ immediates in snd_init itself, so anything that switches modes after
+;   the hook would leave the DAC unwritten and the machine silent.
+;-----------------------------------------------------------------------------
+.proc snd_apply
+        bmi ?auto
+        beq ?out                     ; POKEY: what is assembled here already is it
+        sec
+        sbc #1
+        jsr cv_set_base
+        jmp snd_go_covox
+?auto   jmp snd_detect
+?out    rts
+.endp
 
 ;-----------------------------------------------------------------------------
 ; snd_detect : is a COVOX listening at $D280? Switches the player to 8-bit
@@ -247,6 +284,21 @@ vi2     lda #>snd_irq
 ;   just cannot be autodetected by anyone, only chosen by hand.
 ;-----------------------------------------------------------------------------
 .proc snd_detect
+        jsr snd_probe
+        bcc ?out
+        lda #0                       ; index 0 = $D280 -- the only base a probe can
+        jsr cv_set_base              ;   ever answer from (see the note above)
+        jmp snd_go_covox
+?out    rts
+.endp
+
+;-----------------------------------------------------------------------------
+; snd_probe : the three probes on their own, C = 1 if $D280 answered as a covox.
+;   Split out of snd_detect so the menu can ASK without installing anything --
+;   it needs the answer to preselect a sensible default, but the user may still
+;   pick POKEY or a hand-wired card at another base, and snd_go_covox is one-way.
+;-----------------------------------------------------------------------------
+.proc snd_probe
         jsr cv_probe                 ; 1: does $D280 read back what we write?
         bcs ?yes
         jsr pm_try                   ; 2: a PokeyMAX with its COVOX area off?
@@ -274,9 +326,11 @@ vi2     lda #>snd_irq
         beq ?none                    ; frozen -> POKEY answered -> stay 4-bit
 ?yes    lda #15
         sta AUDF1                    ; ~3995 Hz again (probe 1 hits AUDF1 when
-        jmp snd_go_covox             ;   there is no covox to swallow it)
+        sec                          ;   there is no covox to swallow it)
+        rts
 ?none   lda #15
         sta AUDF1
+        clc
         rts
 .endp
 
@@ -396,8 +450,8 @@ cv_rest dta $FF                      ; RESTRICT as pm_try found it ($FF = not us
         bne ?ld
         beq ?ent                     ; always
 ?done   lda #0                       ; silence the two channels this player does
-        sta COVOXL+2                 ;   NOT drive. On a 4-channel card they sum
-        sta COVOXL+3                 ;   into the same two outputs the driven
+cz2     sta COVOXL+2                 ;   NOT drive. On a 4-channel card they sum
+cz3     sta COVOXL+3                 ;   into the same two outputs the driven
                                      ;   pair does ($D282 -> R, $D283 -> L, both
                                      ;   here and on a PokeyMAX), and probe 3
                                      ;   just left $80 in ch4: its address HAS
@@ -413,6 +467,71 @@ cv_rest dta $FF                      ; RESTRICT as pm_try found it ($FF = not us
         rts
 ?len    dta 0
 .endp
+
+;-----------------------------------------------------------------------------
+; cv_set_base : point every store this player aims at the DAC to base index A.
+;
+;   0 = $D280  PokeyMAX / any card in the POKEY page. The ONLY base that can be
+;              autodetected, and the only one cv_probe/CVPROBE ever touch.
+;   1 = $D500  p-covox jumper 1 -- shares the page with cartridge bank switching
+;              (SpartaDOS X, MaxFlash, SIDE, The!Cart): a write there can bank
+;              the cart out from under the machine, so it is offered but never
+;              probed and never a default.
+;   2 = $D600  p-covox jumper 2 -- VBXE lives at $D600-$D65F and this engine only
+;              runs with VBXE at $D600 (detect_vbxe), so a card that decodes the
+;              whole page latches every register write the display makes. Only
+;              usable for the $D600-$D63F variant.
+;   3 = $D700  p-covox jumper 3 -- nothing else in this machine answers there.
+;              The sane default for a PBI-area card, and what the menu offers.
+;
+;   The player is assembled for $D280, so index 0 rewrites the operands with the
+;   values they already hold -- one code path for both. Patching beats `sta abs,x`
+;   because the DAC write sits in the IRQ head at a FIXED offset from entry (see
+;   cv_next) and the prologue has no index register to spare; the base is chosen
+;   once, at init, so the hot tick pays nothing for it.
+;-----------------------------------------------------------------------------
+.proc cv_set_base
+        tax
+        lda cv_blo,x
+        sta ?bl+1
+        lda cv_bhi,x
+        sta ?bh+1
+        ldy #0
+?ent    lda cvport,y                 ; operand address lo
+        sta ?wl+1
+        sta ?wh+1
+        iny
+        lda cvport,y                 ; operand address hi ($00 ends the table)
+        beq ?done
+        sta ?wl+2
+        sta ?wh+2
+        iny
+?bl     lda #$00                     ; SMC imm : base low ...
+        clc
+        adc cvport,y                 ;   ... + the channel this store drives (0..3)
+        iny
+?wl     sta $FFFF                    ; operand patched three lines up
+        inc ?wh+1                    ; the operand's HIGH byte is the next address
+        bne ?bh
+        inc ?wh+2
+?bh     lda #$00                     ; SMC imm : base high
+?wh     sta $FFFF
+        jmp ?ent
+?done   rts
+.endp
+
+cv_blo  dta $80,$00,$00,$00          ; $D280 / $D500 / $D600 / $D700
+cv_bhi  dta $D2,$D5,$D6,$D7
+
+; cvport : {operand address, channel}. Channels 0 and 3 feed LEFT, 1 and 2 feed
+; RIGHT -- on a PokeyMAX and in Altirra's 4-channel Covox device alike (addr&3).
+cvport  dta a(cv_irq.cvw0+1),        0   ; IRQ head : the sample, left ...
+        dta a(cv_irq.cvw1+1),        1   ;   ... and right
+        dta a(snd_mute.mm5+1),       0   ; snd_mute : park the DAC at mid rail
+        dta a(snd_mute.mm6+1),       1
+        dta a(snd_go_covox.cz2+1),   2   ; the pair this player does not drive
+        dta a(snd_go_covox.cz3+1),   3
+        dta a(0)
 
 ;-----------------------------------------------------------------------------
 ; cvpatch : {dest, length, source image}. Ordered as the code below appears.
@@ -491,8 +610,8 @@ CVTAIL_LEN = cv_tail_end-cv_tail
         lda POKMSK
         sta IRQEN
         lda cv_next
-        sta COVOXL
-        sta COVOXR
+cvw0    sta COVOXL                   ; SMC oper : base+0 / base+1 of whichever
+cvw1    sta COVOXR                   ;   card the menu picked (cv_set_base)
         jmp snd_irq.body
 .endp
 
@@ -509,8 +628,8 @@ mm2     lda #$00                     ; SMC imm  : $00 POKEY / $40 covox level
 mm3     sta AUDC4                    ; SMC oper : AUDC4 / sfx_out
 mm4     rts                          ; SMC op   : $60 rts / $A9 -> lda #$80
         dta $80
-        sta COVOXL
-        sta COVOXR
+mm5     sta COVOXL                   ; SMC oper : the chosen base (cv_set_base)
+mm6     sta COVOXR
         sta cv_next                  ; and the pending byte, so a re-armed timer
         rts                          ;   cannot push a stale sample on tick 1
 .endp
@@ -779,3 +898,9 @@ cvtail_end
 ;-----------------------------------------------------------------------------
         icl 'src/aw_sfx_tables.inc'           ; SFX_COUNT, sfx_bank/winlo/winhi/lenlo/lenhi
         icl 'src/aw_voltab8.inc'              ; voltab8 : the LINEAR curves (covox mode)
+        icl 'src/aw_test_sfx.inc'             ; TST_* : the menu's baked GAME sounds
+                                              ;   (tools/gen_test_sfx.py). TABLES ONLY --
+                                              ;   the blob itself streams to VRAM from
+                                              ;   aw_data.asm, where the org is a window
+                                              ;   address and a table would land ON the
+                                              ;   samples it describes.

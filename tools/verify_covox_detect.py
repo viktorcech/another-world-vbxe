@@ -231,6 +231,45 @@ class CPU:
                 self.c = self.x >= v
                 self.nz((self.x - v) & 0xFF)
                 pc += 2 if op == 0xE0 else 3
+            elif op in (0x78, 0x58, 0xEA): pc += 1    # sei/cli/nop: no state here
+            elif op == 0x4A:
+                self.c = bool(self.a & 1)
+                self.a = self.nz(self.a >> 1)
+                pc += 1
+            elif op == 0x8A: self.a = self.nz(self.x);                pc += 1
+            elif op == 0xA8: self.y = self.nz(self.a);                pc += 1
+            elif op == 0xAE: self.x = self.nz(self.rd(ab));           pc += 3
+            elif op == 0xAC: self.y = self.nz(self.rd(ab));           pc += 3
+            elif op == 0xA6: self.x = self.nz(self.rd(im));           pc += 2
+            elif op == 0x98: self.a = self.nz(self.y);                pc += 1
+            elif op == 0x99: self.wr((ab + self.y) & 0xFFFF, self.a);  pc += 3
+            elif op == 0xFD:
+                v = self.rd((ab + self.x) & 0xFFFF)
+                t = self.a - v - (0 if self.c else 1)
+                self.c = t >= 0
+                self.a = self.nz(t & 0xFF)
+                pc += 3
+            elif op == 0xAA: self.x = self.nz(self.a);                pc += 1
+            elif op == 0xA5: self.a = self.nz(self.rd(im));           pc += 2
+            elif op == 0x85: self.wr(im, self.a);                     pc += 2
+            elif op == 0xCA: self.x = self.nz((self.x - 1) & 0xFF);   pc += 1
+            elif op == 0x88: self.y = self.nz((self.y - 1) & 0xFF);   pc += 1
+            elif op == 0xEE:
+                v = (self.rd(ab) + 1) & 0xFF
+                self.wr(ab, v)
+                self.nz(v)
+                pc += 3
+            elif op in (0x69, 0x79):
+                v = im if op == 0x69 else self.rd((ab + self.y) & 0xFFFF)
+                t = self.a + v + (1 if self.c else 0)
+                self.c = t > 0xFF
+                self.a = self.nz(t & 0xFF)
+                pc += 2 if op == 0x69 else 3
+            elif op == 0xE9:
+                t = self.a - im - (0 if self.c else 1)
+                self.c = t >= 0
+                self.a = self.nz(t & 0xFF)
+                pc += 2
             elif op == 0x29: self.a = self.nz(self.a & im);           pc += 2
             elif op == 0x2D: self.a = self.nz(self.a & self.rd(ab));  pc += 3
             elif op == 0x09: self.a = self.nz(self.a | im);           pc += 2
@@ -257,7 +296,7 @@ class CPU:
             else:
                 raise SystemExit('verify_covox_detect: opcode $%02X at $%04X is '
                                  'not modelled -- extend CPU.run' % (op, pc))
-        raise SystemExit('verify_covox_detect: snd_detect did not terminate')
+        raise SystemExit('verify_covox_detect: the routine did not terminate')
 
 
 # --- checks ------------------------------------------------------------------

@@ -20,6 +20,7 @@
 ;     src/aw_polygon.asm   far-data fetch, zoom/slope math, the poly decoder
 ;     src/aw_raster.asm    integer 16.16 raster, scanline -> span emit
 ;     src/aw_vbxe.asm      VBXE bring-up, palettes, page/blitter primitives
+;     src/aw_settings.asm  pre-intro POKEY/COVOX-address menu (snd_settings)
 ;     src/aw_data.asm      pal_data + font/strings + poly/playlist VRAM stream
 ;
 ;   CODE MUST STAY BELOW $4000 (the MEMAC-B window hides $4000-$7FFF when poly
@@ -55,4 +56,5 @@ ICAX2       equ $034B
         icl 'src/aw_raster.asm'
         icl 'src/aw_vbxe.asm'
         icl 'src/aw_sound.asm'         ; POKEY SFX player (op 0x08) + VRAM sfx tables
+        icl 'src/aw_settings.asm'      ; pre-intro menu: POKEY / COVOX base select
         icl 'src/aw_data.asm'

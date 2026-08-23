@@ -303,13 +303,71 @@ LD_HOLD = 50                         ; vblanks the screen is held (~1 s PAL / 0.
         ;   spinning a further ~5 s for the counter to wrap all the way round.
         ;   RTCLOK3 is bumped by the OS VBI, which is an NMI -- it keeps ticking under
         ;   load_part's sei. X is dead here (load_part reloads it from dk_idx).
+        ; BOUNDED hold. The inner wait used to be `cmp RTCLOK3 / beq *-3` with no
+        ; way out: if the OS VBI is not running (RTCLOK3 frozen) it spins FOREVER --
+        ; with "LOADING..." already painted, which is indistinguishable from the
+        ; loader hanging. ~130 k polls (~0.7 s) per tick, then give up the hold
+        ; entirely and let the load start.
         ldx #LD_HOLD
         lda RTCLOK3
-?hold   cmp RTCLOK3
-        beq ?hold                    ; same jiffy -> wait for the next VBI
-        lda RTCLOK3                  ; re-latch: one tick counted
+        sta ?last
+?hold   lda #2
+        sta ?hi
+        ldy #0
+?h2     lda ?last
+        cmp RTCLOK3
+        bne ?tick                    ; a jiffy went by -> count it
+        dey
+        bne ?h2
+        dec ?hi
+        bne ?h2
+        rts                          ; RTCLOK3 dead -> do not hold at all
+?tick   lda RTCLOK3
+        sta ?last
         dex
         bne ?hold
         rts
+?last   dta 0
+?hi     dta 0
 ld_str  dta c'LOADING...',0
 .endp
+
+    .ifdef LOAD_DEBUG
+;=============================================================================
+; ld_tint : A = 1..6, repaint palette-1 index 1 (the colour draw_loading printed
+;   "LOADING..." in). load_part calls it between streams, so if the machine dies
+;   mid-load the colour on screen says exactly WHICH stream it died in:
+;       white  = never got past draw_loading / the very first SIO call
+;       red    = video1     green = bytecode   blue = video2
+;       yellow = palette    cyan  = sounds     white again = part fully loaded
+;   Costs 6 register writes, touches nothing else, needs no font or blitter.
+;=============================================================================
+.proc ld_tint
+        sec
+        sbc #1
+        sta ?t
+        asl @
+        clc
+        adc ?t                       ; (stage-1)*3
+        tax
+        lda #1
+        sta VBXE_PSEL                ; palette 1 (draw_loading's)
+        lda #1
+        sta VBXE_CSEL                ; index 1 = the text colour
+        lda ?tab,x
+        sta VBXE_CR
+        lda ?tab+1,x
+        sta VBXE_CG
+        lda ?tab+2,x
+        sta VBXE_CB
+        rts
+?t      dta 0
+?tab    dta $F0,$00,$00              ; 1 red    - video1
+        dta $00,$F0,$00              ; 2 green  - bytecode
+        dta $40,$40,$F0              ; 3 blue   - video2
+        dta $F0,$F0,$00              ; 4 yellow - palette
+        dta $00,$F0,$F0              ; 5 cyan   - sounds
+        dta $F0,$F0,$F0              ; 6 white  - done
+.endp
+    .endif
+

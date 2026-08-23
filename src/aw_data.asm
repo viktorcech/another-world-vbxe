@@ -1,3 +1,19 @@
+; disable_basic : runs DURING LOAD (an `ini` segment -- the boot loader's do_init JSRs it,
+; and the OS XEX loader runs it too), BEFORE the $A000/$B000 segments below are written.
+; On an XL/XE that boots WITHOUT OPTION held, BASIC is enabled and $A000-$BFFF is ROM:
+; the writes are ignored, so fmul_sq* ($A000) and aw_font ($B000) stay whatever was in
+; RAM. `start` then disables BASIC and reads that garbage -- the sound menu draws every
+; glyph as horizontal stripes (the palette is at $9000, which is why the colours and the
+; layout still look right). Never seen from SIDE3 (a cartridge keeps BASIC off) or in
+; Altirra with BASIC disabled. awgame.asm has had the same ini since the $B400 modules
+; moved there; the intro was missing it.
+disable_basic
+        lda PORTB
+        ora #$02                            ; bit1 = 1 : BASIC ROM off -> RAM at $A000-$BFFF
+        sta PORTB
+        rts
+        ini disable_basic
+
 ;=============================================================================
 ; Big data : above the MEMAC-A window (RAM at $9000+, never inside a window)
 ;=============================================================================
@@ -218,5 +234,9 @@ poly_win_lut
         ini ?sm12
         org DATAW
         ins 'out/intro_music.bin', $1C000              ; remaining bytes to EOF
+
+; The pre-intro menu's test sounds: real GAME SFX baked into this build by
+; tools/gen_test_sfx.py, into the dead tail of the last MUSIC bank ($12).
+        icl 'src/aw_test_sfx_data.inc'
 
         run start

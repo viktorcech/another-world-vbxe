@@ -57,11 +57,18 @@ hs_div   = $B3D6                    ; negotiated high-speed AUDF3 index ($01 = n
 ;   in : DAUX1/2 = start sector, DBUFLO/HI = dest, X = count
 ;   out: C=0 ok / C=1 error ; advances DBUF + DAUX
 ;=============================================================================
+RS_RETRY = 4
 .proc read_sectors
         stx rs_cnt
-?lp     jsr read_one                ; high speed if available, else stock SIOV
-        bcs ?err
-        lda DBUFLO                  ; dest += 128
+?lp     lda #RS_RETRY
+        sta rs_try
+?try    jsr read_one                ; high speed if available, else stock SIOV
+        bcc ?ok
+        dec rs_try                  ; nobody up the chain looks at the carry, so a
+        bne ?try                    ;   dropped sector used to become an unloaded
+        sec                         ;   VRAM bank and a VM running garbage. Re-ask.
+        rts
+?ok     lda DBUFLO                  ; dest += 128
         clc
         adc #128
         sta DBUFLO
@@ -74,9 +81,8 @@ hs_div   = $B3D6                    ; negotiated high-speed AUDF3 index ($01 = n
         bne ?lp
         clc
         rts
-?err    sec
-        rts
 rs_cnt  dta 0
+rs_try  dta 0
 .endp
 
 ;-----------------------------------------------------------------------------
@@ -100,23 +106,31 @@ rs_cnt  dta 0
 .endp
 
 ;-----------------------------------------------------------------------------
-; std_read_one : stock OS SIOV read of one 128-byte sector (DAUX -> DBUF).
+; dcb_base : the DCB fields std_read_one and hs_poll set identically. Factored out
+;   because the $B400 block ends at the $C000 OS-ROM ceiling and had no room left.
 ;-----------------------------------------------------------------------------
-.proc std_read_one
+dcb_base
         lda #$31
         sta DDEVIC
         lda #$01
         sta DUNIT
-        lda #$52                    ; read sector
-        sta DCOMND
         lda #$40                    ; receive data
         sta DSTATS
+        lda #$0F
+        sta DTIMLO
+        rts
+
+;-----------------------------------------------------------------------------
+; std_read_one : stock OS SIOV read of one 128-byte sector (DAUX -> DBUF).
+;-----------------------------------------------------------------------------
+.proc std_read_one
+        jsr dcb_base
+        lda #$52                    ; read sector
+        sta DCOMND
         lda #128
         sta DBYTLO
         lda #0
         sta DBYTHI
-        lda #$0F
-        sta DTIMLO
         jsr SIOV
         bmi ?err
         clc
@@ -125,6 +139,20 @@ rs_cnt  dta 0
         rts
 .endp
 
+;=============================================================================
+; --- HIGH-SPEED SIO BLOCK, RELOCATED to the free $0DB0-$0F7F low RAM gap -----
+; The $B400 block ends at the $C000 OS-ROM ceiling with ~9 bytes to spare, and the
+; hardening below does not fit there.  $0DB0-$0F7F is free at RUN time: game_text
+; has $0900-$0B31, game_sound's covox $0BC0-$0DAD, aw_raster's adv_edges1
+; $0F80-$0FBA, the boot loader's area ends at $08FF and every other segment starts
+; >= $1000.  Same `org` idiom as the covox block; check_xex.py verifies it.
+;
+; NOTE: this whole block is currently NOT CALLED -- load_part forces hs_div=1 so
+; every sector goes through stock SIOV.  See the comment there.
+;=============================================================================
+diskio_resume equ *
+        org $0DB0
+
 ;-----------------------------------------------------------------------------
 ; hs_poll : ask D1: for its high-speed SIO divisor (command $3F). Stores the
 ;   POKEY AUDF3 index in hs_div (2..$27 = usable), else $01 (none). Stock SIOV,
@@ -132,14 +160,9 @@ rs_cnt  dta 0
 ;   speed NAK $3F -> hs_div=$01 -> everything stays stock (unchanged behaviour).
 ;-----------------------------------------------------------------------------
 .proc hs_poll
-        lda #$31
-        sta DDEVIC
-        lda #$01
-        sta DUNIT
+        jsr dcb_base
         lda #$3f                    ; poll high-speed index
         sta DCOMND
-        lda #$40                    ; receive 1 byte
-        sta DSTATS
         lda #<hs_pbuf
         sta DBUFLO
         lda #>hs_pbuf
@@ -148,8 +171,6 @@ rs_cnt  dta 0
         sta DBYTLO
         lda #0
         sta DBYTHI
-        lda #$0F
-        sta DTIMLO
         jsr SIOV
         bmi ?none
         lda hs_pbuf
@@ -221,9 +242,16 @@ hs_pbuf dta 0
         jsr ?wait_txr               ; last byte into the shift register...
         lda #$08
         sta p_IRQEN                 ; ...then wait for full transmit-complete
-?txc    lda #$08
+        ldy #$00                    ; BOUNDED, same reason as ?wait_txr
+?txc    ldx #$00
+?txc2   lda #$08
         bit p_IRQST
+        beq ?txd
+        dex
+        bne ?txc2
+        dey
         bne ?txc
+?txd
 
         lda #$3c                    ; deassert COMMAND line
         sta p_PBCTL
@@ -265,16 +293,31 @@ hs_pbuf dta 0
         cmp $34
         bne ?fail
 
-        lda #$13
-        sta p_SKCTL
+        jsr ?pokey_idle
         plp
         clc
         rts
 
-?fail   lda #$13
-        sta p_SKCTL
+?fail   jsr ?pokey_idle
         plp
         sec
+        rts
+
+; ?pokey_idle : put POKEY back the way the OS expects BEFORE plp lets IRQs in.
+;   This used to leave SKCTL in async-receive mode AND IRQEN armed for SERIN
+;   ($20, written by ?grdy). With IRQs back on and no OS SIO call in flight, one
+;   stray byte on the line then raised a serial IRQ that ran VIMIRQ -> snd_irq ->
+;   chain -> the OS serial handler, which stores through BUFRLO/BUFRHI ($30/$31)
+;   and tests BFENLO/BFENHI -- and $32/$33 are this routine's destination pointer.
+;   Result: silent corruption plus OS SIO flags left in a state that wedges the
+;   NEXT SIOV -> "LOADING..." reads a bit and then hangs. Only reachable over
+;   real SIO: SIDE3/AVG/SUB answer no $3F, so hs_div stays 1 and this whole
+;   high-speed path is never entered -- which is why it never showed up here.
+?pokey_idle
+        lda #$13
+        sta p_SKCTL
+        lda $10                     ; POKMSK (zp) = the OS shadow of IRQEN
+        sta p_IRQEN
         rts
 
 ?send_chk                           ; send A, fold into checksum $34
@@ -291,11 +334,17 @@ hs_pbuf dta 0
         sta p_SEROUT
         rts
 
-?wait_txr                           ; wait serial-output-ready, then reset it
-        lda #$10
-?wl     bit p_IRQST
+?wait_txr                           ; wait serial-output-ready, then reset it.
+        ldy #$00                    ; BOUNDED: this loop had NO exit -- any POKEY
+?wl     ldx #$00                    ;   hiccup wedged the machine forever with
+?wl2    lda #$10                    ;   "LOADING..." already on screen.  ~65 k polls
+        bit p_IRQST                 ;   >> one byte time at any speed on any CPU; on
+        beq ?wrdy                   ;   timeout fall through, the drive then does not
+        dex                         ;   ACK and ?get fails down the normal path.
+        bne ?wl2
+        dey
         bne ?wl
-        lda #$ef
+?wrdy   lda #$ef
         sta p_IRQEN
         lda #$10
         sta p_IRQEN
@@ -327,6 +376,9 @@ hs_pbuf dta 0
         clc
         rts
 .endp
+
+        ert *>$0F80                 ; aw_raster's adv_edges1 owns $0F80-$0FBA
+        org diskio_resume           ; --- back into the $B400 block ---
 
 ;=============================================================================
 ; stream_to_vram : load dk_cnt sectors from dk_sec into VRAM, base bank in A.
@@ -417,7 +469,22 @@ hs_pbuf dta 0
         sta POKMSK
         sta IRQEN
         cli                         ; SIOV needs the serial IRQ
-        jsr hs_poll                 ; negotiate high-speed SIO once for this load
+        ; --- NO high-speed negotiation. ------------------------------------------
+        ; The $3F poll and the POKEY-level reader are the ONLY thing this loader does
+        ; that the boot loader ($0700, plain SIOV) does not -- and the boot loader
+        ; demonstrably reads the whole xex fine on the very machine where the part
+        ; stream dies right after "LOADING..." appears. They are also the only code
+        ; that behaves differently on a device that answers $3F (SIO2SD does,
+        ; SIDE3/AVG/SUB do not, Altirra with accelerated SIO does not) -- i.e. dead
+        ; code on every machine this was developed on and live code on exactly the
+        ; one that hangs. On a machine with a high-speed SIO patch in the OS there is
+        ; nothing to win here anyway: SIOV is already fast.
+        lda #$01                    ; $01 = "no high speed" -> read_one takes ?std
+        sta hs_div                  ;        -> std_read_one -> stock SIOV
+    .ifdef LOAD_DEBUG               ; -d:LOAD_DEBUG=1 tints "LOADING..." per stage, so
+        lda #1                      ;   a hang says WHICH stream it died in. OFF in a
+        jsr ld_tint                 ;   normal build -- the text just stays white.
+    .endif
         ; --- video1 -> banks $14 ---
         ldx dk_idx
         lda atr_v1_sec_lo,x
@@ -430,6 +497,10 @@ hs_pbuf dta 0
         sta dk_cnt+1
         lda #POLY_BANK0
         jsr stream_to_vram
+    .ifdef LOAD_DEBUG
+        lda #2
+        jsr ld_tint
+    .endif
         ; --- bytecode -> banks $18 ---
         ldx dk_idx
         lda atr_code_sec_lo,x
@@ -442,6 +513,10 @@ hs_pbuf dta 0
         sta dk_cnt+1
         lda #PLAY_BANK0
         jsr stream_to_vram
+    .ifdef LOAD_DEBUG
+        lda #3
+        jsr ld_tint
+    .endif
         ; --- video2 -> banks $1C (skip if this part has none) ---
         ldx dk_idx
         lda atr_v2_cnt_lo,x
@@ -458,7 +533,12 @@ hs_pbuf dta 0
         sta dk_cnt+1
         lda #POLY_BANK0+8
         jsr stream_to_vram
-?nov2   ; --- palette -> RAM pal_data ($9000) ---
+?nov2
+    .ifdef LOAD_DEBUG
+        lda #4
+        jsr ld_tint
+    .endif
+        ; --- palette -> RAM pal_data ($9000) ---
         ldx dk_idx
         lda atr_pal_sec_lo,x
         sta DAUX1
@@ -472,6 +552,10 @@ hs_pbuf dta 0
         lda atr_pal_cnt,x
         tax
         jsr read_sectors
+    .ifdef LOAD_DEBUG
+        lda #5
+        jsr ld_tint
+    .endif
         ; --- this part's full SFX set -> the snd_blist banks + select its dir slice ---
         ldx dk_idx
         lda snd_pdir_start,x
@@ -479,6 +563,10 @@ hs_pbuf dta 0
         lda snd_pdir_cnt,x
         sta cur_dir_cnt
         jsr load_sounds
+    .ifdef LOAD_DEBUG
+        lda #6                      ; stage 6 = whole part in, back to white
+        jsr ld_tint
+    .endif
         sei                         ; back to IRQ-off for the VM
         rts
 .endp

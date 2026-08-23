@@ -19,7 +19,10 @@
 ; Zero page pointer for indirect store (must be in ZP)
 zp_dest     = $E0              ; 2 bytes: destination pointer (free ZP area)
 
-SECBUF      = $0800             ; 128-byte sector read buffer
+; Moved $0800 -> $0880 to make room for read_sec's retry loop: the OS loads 3
+; boot sectors = 384 B to $0700-$087F, so the loader itself may grow to $087F,
+; and $0880-$08FF is free RAM in BOTH xex files.
+SECBUF      = $0880             ; 128-byte sector read buffer
 
 ; === Boot entry point ===
 boot_init
@@ -116,8 +119,16 @@ get_byte
         rts
 
 ; === Read one sector via SIO ===
+; SIOV returns the status in Y (N set on error). It used to be thrown away, so on
+; real SIO one dropped sector meant the XEX parser silently swallowed 128 STALE
+; bytes out of SECBUF -- a random hole anywhere in the loaded program.
+; NOTE: read_sec's local labels are rd_* on purpose. This file has no .proc, so a
+; `?ok` here would silently merge with get_byte's `?ok`.
+RD_TRY      = 8
 read_sec
-        lda #$31
+        lda #RD_TRY
+        sta rd_left
+rd_lp   lda #$31
         sta $0300               ; DDEVIC (disk)
         lda #$01
         sta $0301               ; DUNIT (drive 1)
@@ -139,15 +150,26 @@ read_sec
         sta $030A               ; DAUX1 (sector lo)
         lda cur_sec+1
         sta $030B               ; DAUX2 (sector hi)
-        jsr $E459               ; SIOV
-        inc cur_sec
-        bne ?done
+        jsr $E459               ; SIOV -> Y = status, N set on error
+        bpl rd_ok               ; success: the buffer really holds this sector
+        dec rd_left
+        bne rd_lp               ; transient -> re-read the SAME sector
+        inc $D01A               ; out of tries: tint the border and keep trying --
+        lda #RD_TRY             ;   a stalled loader is far less damage than a
+        sta rd_left             ;   silently corrupt program image
+        bne rd_lp
+rd_ok   inc cur_sec
+        bne rd_done
         inc cur_sec+1
-?done   lda #0
+rd_done lda #0
         sta buf_pos
         rts
 
 ; === Variables ===
+; src/aw_exit.asm pokes cur_sec/buf_pos from the intro through hard-coded
+; addresses (BOOT_CURSEC/BOOT_BUFPOS); tools/make_full_atr.py fails the build if
+; they drift. Anything added ABOVE moves them.
+rd_left     dta 0               ; read_sec retry counter
 cur_sec     dta a(4)            ; current sector number (XEX starts at 4)
 buf_pos     dta 128             ; position in buffer (128 = force first read)
 seg_lo      dta 0

@@ -10,7 +10,21 @@ Runs on **real Atari hardware**.
 
 - **Atari XE/XL** with **64 KB RAM** and **VBXE**.
 - **Rapidus** accelerator **recommended** (for full speed).
-- **Covox** 8-bit DAC — **optional**, auto-detected at start. Where one is found (PokeyMAX or a compatible card at `$D280`), both sample players re-route their output to it instead of POKEY's volume-only channels: same 4-bit data, but a linear R-2R ladder instead of POKEY's bent DAC, and no channel-summing compression. Nothing to configure; without one the POKEY code is what runs.
+- **Covox** 8-bit DAC — **optional**. Where one is used, both sample players re-route their output to it instead of POKEY's volume-only channels: same sample data, but a linear R-2R ladder instead of POKEY's bent DAC, and no channel-summing compression. Without one the POKEY code is what runs.
+
+## Sound menu
+
+The disk opens on a short menu, before the intro:
+
+| Key | Action |
+|-----|--------|
+| **SELECT** | next output option |
+| **OPTION** | play a test sound through it |
+| **START** | begin |
+
+The options are POKEY 4-bit, or covox at `$D280`, `$D500`, `$D600` or `$D700`. Only `$D280` (PokeyMAX, or Altirra's Covox device) can be probed — it is preselected when it answers. The other three are write-only latches with nothing to read back and nothing else answering there, so no program can find them; the test sound is the honest substitute. It plays a real game SFX rather than a beep, so it exercises the whole path, not just the wiring. Pick `$D600` only with a card that decodes `$D600-$D63F` — VBXE itself lives in that page.
+
+The choice carries over from the intro into the game.
 
 ## Build requirements
 
