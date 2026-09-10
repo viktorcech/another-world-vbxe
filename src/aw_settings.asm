@@ -142,8 +142,29 @@ NOPT    = 5                          ; POKEY + four covox bases
 ;   ~444 cycles per nibble = the ~3995 Hz the samples were baked at. Each sound
 ;   is under half a second by construction, and the window-end check is a belt-
 ;   and-braces stop: nothing here walks a bank list the way the IRQ does.
+;
+;   The covox path parks base+2/base+3 at mid rail first. This is the ONLY place
+;   that has to do it itself: on a 4-channel card those two channels sum into the
+;   same two outputs the driven pair feeds, and at menu time nothing in the
+;   machine has ever written them -- on real hardware they hold whatever the
+;   latches powered up with. snd_go_covox does the same, but only at snd_init,
+;   which is after START.
 ;-----------------------------------------------------------------------------
-PRV_D   = 79                         ; delay iterations: 5*79-1 + ~50 cyc of work
+; Delay iterations. The two halves of the inner loop are NOT symmetric: after
+; the LOW nibble the loop also does inc ?rd+1 / inc ?nl / jmp / the window-end
+; check / the byte fetch and unpack -- 39 cycles the HIGH nibble's half does not
+; pay. With one constant for both the sample clock alternated 426 / 465 cycles,
+; an 8.8% square-wave modulation at exactly Fs/2 = 2009 Hz: a whistling tone laid
+; over every test sound, on POKEY and covox alike (they share ?snd). Measured on
+; the assembled bytes, the two halves are
+;     A = 5*PRV_DH + 31      (hi -> lo nibble)
+;     B = 5*PRV_DL + 70      (lo -> hi nibble)
+; so PRV_DL has to run 8 iterations short. 83/75 gives 446 / 445 -- one cycle
+; apart, and the mean period stays 445.5 cycles = the ~4 kHz the samples were
+; baked at. The IRQ-driven players do not need this: Timer 1 is exact by
+; construction, which is why only the menu's test tone ever whistled.
+PRV_DH  = 83                         ; hi -> lo nibble
+PRV_DL  = 75                         ; lo -> hi nibble: 39 cycles of loop tail
 
 .proc snd_preview
         lda #0
@@ -164,14 +185,25 @@ PRV_D   = 79                         ; delay iterations: 5*79-1 + ~50 cyc of wor
         rts                          ;   NONE: stay silent rather than answer with
                                      ;   POKEY noise the user would misread
 ?cv     dex                          ; 1..4 -> covox base index 0..3
-        lda cv_blo,x
+        lda cv_bhi,x                 ; the page is the same for all four ports
+        sta ?o1+2
+        sta ?o2+2
+        lda cv_blo,x                 ; --- the pair this player does NOT drive:
+        clc                          ;     park it at MID RAIL, once, before the
+        adc #2                       ;     first sample. On a 4-channel card the
+        sta ?o1+1                    ;     pairs SUM into one output each, so a
+        adc #1                       ;     channel still holding its power-on
+        sta ?o2+1                    ;     value drags the analogue sum off
+        lda #$80                     ;     centre and can clip the whole test
+        jsr ?snd                     ;     tone. snd_go_covox parks them too, but
+                                     ;     that runs at snd_init -- AFTER this
+                                     ;     menu, so the test sound is the one
+                                     ;     place nothing has ever written them.
+        lda cv_blo,x                 ; --- and now the driven pair
         sta ?o1+1
         clc
         adc #1                       ; base+0 = left, base+1 = right
         sta ?o2+1
-        lda cv_bhi,x
-        sta ?o1+2
-        sta ?o2+2
         ldy #15                      ; the LINEAR curve at full volume, lifted by
 ?cl     lda voltab8+15*16,y          ;   the 64 the mix tail adds for a silent
         clc                          ;   music voice -- so the DAC swings around
@@ -211,7 +243,16 @@ PRV_D   = 79                         ; delay iterations: 5*79-1 + ~50 cyc of wor
         lda #0
         sbc tst_lenhi,x
         sta ?nh
-        sei                          ; the OS VBI would warble the sample clock
+        sei                          ; the OS VBI would warble the sample clock --
+        lda #0                       ;   and SEI does not mask NMI, so the VBI has
+        sta NMIEN                    ;   to go too: ~1000 cycles stolen 50x a second
+                                     ;   is an audible tick on a 4 kHz stream. Safe
+                                     ;   for the ~0.45 s this runs: ANTIC playfield
+                                     ;   DMA is already off (SDMCTL = 0), the display
+                                     ;   is XDL-driven, read_console polls CONSOL
+                                     ;   itself, and nothing here needs RTCLOK. The
+                                     ;   real covox players do the same (examples/
+                                     ;   players/inertia_player_4.5: jsr os_off).
 ?loop   lda ?rd+2
         cmp #$80
         bcs ?end                     ; ran into the next bank: stop, no walk
@@ -224,7 +265,7 @@ PRV_D   = 79                         ; delay iterations: 5*79-1 + ~50 cyc of wor
         tay
         lda prv_vt,y
         jsr ?snd
-        ldy #PRV_D
+        ldy #PRV_DH
 ?dh     dey
         bne ?dh
         txa
@@ -239,7 +280,7 @@ PRV_D   = 79                         ; delay iterations: 5*79-1 + ~50 cyc of wor
         bne ?more
         inc ?nh
         beq ?end
-?more   ldy #PRV_D
+?more   ldy #PRV_DL                  ; 8 short: this half carries the loop tail
 ?dl     dey
         bne ?dl
         jmp ?loop
@@ -250,6 +291,8 @@ PRV_D   = 79                         ; delay iterations: 5*79-1 + ~50 cyc of wor
 ?pk     jsr ?snd
         lda memb_cur                 ; MEMAC-B back to the engine's invariant
         sta VBXE_MEMAC_B
+        lda #$40                     ; VBI back on (the OS value: no DLI in this
+        sta NMIEN                    ;   engine, ANTIC playfield DMA is off)
         cli
         rts
 ?snd    ; A = one sample level -> both ports of the chosen output

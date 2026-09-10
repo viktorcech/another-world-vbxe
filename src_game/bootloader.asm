@@ -24,12 +24,33 @@ zp_dest     = $E0              ; 2 bytes: destination pointer (free ZP area)
 ; and $0880-$08FF is free RAM in BOTH xex files.
 SECBUF      = $0880             ; 128-byte sector read buffer
 
+; Sectors per one percent step of the "LOADING... nn%" counter. build.ps1 passes
+; the real value (ceil(intro_sectors/100)) once the intro's size is known; the
+; default only serves ad-hoc assembly. Too SMALL a value overflows past 99%.
+.ifndef PCT_STEP
+PCT_STEP equ 30
+.endif
+
 ; === Boot entry point ===
 boot_init
-        ; Disable screen for fast loading
+        jsr vbxe_check          ; no VBXE/FX core -> message + halt NOW, ~1 s after
+                                ;   power-on, instead of after the whole intro load
         lda #0
-        sta $22F                ; SDMCTL off
-        sta $D400               ; DMACTL off
+        sta $41                 ; SOUNDR = 0: SIOV reads it per call, so this one
+                                ;   store silences the whole multi-minute load buzz
+        ; The OS boot screen STAYS ON while the xex streams in (intro and game both
+        ; kill ANTIC DMA themselves in their init) showing "LOADING... nn%" top-left.
+        ; The intro->game chain re-enters boot_init with the screen already dark
+        ; (aw_replayer zeroed SDMCTL) and SAVMSC pointing into RAM the game xex is
+        ; loaded OVER -- so every draw, here and in read_sec, is gated on SDMCTL.
+        lda $22F                ; SDMCTL: $22 = first boot, 0 = dark chain load
+        beq ld_dark
+        ldy #LMSG_L-1
+ld_cp   lda load_msg,y
+        sta ($58),y             ; (SAVMSC) = top-left of screen RAM
+        dey
+        bpl ld_cp
+ld_dark
 
         ; Skip $FF $FF XEX header
         jsr get_byte
@@ -108,9 +129,8 @@ jsr_tgt jmp $0000               ; patched, called via JSR
 
 ; === Get next byte from sector buffer ===
 get_byte
-        ldx buf_pos
-        cpx #128
-        bcc ?ok
+        ldx buf_pos             ; buf_pos is only ever 0..128, so bit 7 (= N on
+        bpl ?ok                 ;   the ldx) set means exactly "buffer used up"
         jsr read_sec
         ldx #0
 ?ok     lda SECBUF,x
@@ -159,8 +179,26 @@ rd_lp   lda #$31
         sta rd_left             ;   silently corrupt program image
         bne rd_lp
 rd_ok   inc cur_sec
-        bne rd_done
+        bne rd_pct
         inc cur_sec+1
+rd_pct  lda $22F                ; dark chain load -> (SAVMSC) is game RAM, no draws
+        beq rd_done
+        dec pct_left            ; one more percent every PCT_STEP sectors
+        bne rd_done
+        lda #PCT_STEP
+        sta pct_left
+        ldy #12                 ; "LOADING... 00%" -> units digit at column 12
+        lda ($58),y
+        clc
+        adc #1
+        cmp #$1A                ; past screen-code '9' ($19)?
+        bcc rd_put
+        lda #$10                ; wrap units to '0' (carry stays set for the tens)
+        sta ($58),y
+        dey
+        lda ($58),y
+        adc #0                  ; C=1 -> tens digit + 1
+rd_put  sta ($58),y
 rd_done lda #0
         sta buf_pos
         rts
@@ -176,3 +214,42 @@ seg_lo      dta 0
 seg_hi      dta 0
 end_lo      dta 0
 end_hi      dta 0
+pct_left    dta PCT_STEP        ; sectors left until the next percent bump; never
+                                ;   reset on the chain re-entry -- the dark-screen
+                                ;   gate in read_sec skips the whole counter there
+
+; === VBXE FX-core check (feedback: fail FAST, not after minutes of loading) ===
+; Mirrors src/aw_vbxe.asm detect_vbxe's $D600 test: CORE_VERSION ($D640) == $10
+; (FX core 1.xx) AND (MINOR_REVISION ($D641) & $70) >= $20 (v1.20+). The engine
+; only runs at base $D600, so a card strapped to $D700 gets the same message the
+; intro would have shown -- just minutes earlier. The copy is unavoidable (this
+; runs before one byte of any xex is in RAM); tools/make_full_atr.py compares the
+; emitted constants against detect_vbxe's in both xex files and fails the build
+; if the two tests ever drift apart. Placed AFTER the variables so the jsr above
+; moves cur_sec/buf_pos by only 3 bytes.
+; The OS boot screen (E:) is still ON here -- boot_init kills DMA only after this
+; returns -- so on failure the text goes straight into screen RAM via SAVMSC,
+; top-left on the standard blue boot screen. vc_* labels: no .proc in this file,
+; a ?-local here would merge with get_byte's (see read_sec's note above).
+vbxe_check
+        lda $D640               ; CORE_VERSION
+        cmp #$10                ; $10 = FX core 1.xx
+        bne vc_no
+        lda $D641               ; MINOR_REVISION
+        and #$70
+        cmp #$20                ; >= v1.20
+        bcs vc_ok
+vc_no   ldy #VMSG_L-1
+vc_cp   lda vbxe_msg,y
+        sta ($58),y             ; (SAVMSC) = top-left of screen RAM
+        dey
+        bpl vc_cp
+vc_halt bmi vc_halt             ; dead end (the dey/bpl loop above fell out with
+vc_ok   rts                     ;   N=1, and branches keep flags -> loops forever)
+vbxe_msg dta d'VBXE NOT DETECTED!'
+VMSG_L  equ *-vbxe_msg
+load_msg dta d'LOADING... 00%' ; same wording as the game's part-load string;
+LMSG_L  equ *-load_msg          ;   read_sec bumps the digits at columns 11/12
+
+        ert *>SECBUF            ; the OS reads 3 boot sectors = the image must
+                                ;   end below SECBUF ($0880)

@@ -106,6 +106,24 @@ cl0 equ $C4
 cl1 equ $C5
 cl2 equ $C6
 cl3 equ $C7
+.if 1
+; $C8-$CF : the old str0..stl3 (step_r/step_l) cells -- unused since the steps became
+; SMC immediates in the ?row loop. Skill pass 2026-09-09: the HOTTEST raster/edge
+; cells move here from the RAMB block ("move the code from the slow region to the fast
+; one" -- every lda/sta/inc/dec on them costs 1 cycle less in zero page; game_zp.inc
+; measured the same move for the decoder locals). Both builds share this file.
+hy_lo   equ $C8                    ; current scanline y (per-row inc + tests)
+hy_hi   equ $C9
+row_cnt equ $CA                    ; rows left in the segment (per-row dec)
+hh      equ $CB                    ; max(h,1) (divisor, 8-bit) -- calc_step, 3x per edge
+dv_lo   equ $CC                    ; signed dx for calc_step, 3-4x per edge
+dv_hi   equ $CD
+dvsign  equ $CE                    ; calc_step sign flag
+N1      equ $CF                    ; slope byte 1 (the most-touched N cell: 4x per edge)
+; divide work area (N = dividend/quotient, V = divisor, R = remainder)
+N0 equ RAMB+16
+; RAMB+17 (N1) -> zero page, see $C8-$CF above
+.else
 str0 equ $C8                       ; step_r (4)
 str1 equ $C9
 str2 equ $CA
@@ -117,24 +135,35 @@ stl3 equ $CF
 ; divide work area (N = dividend/quotient, V = divisor, R = remainder)
 N0 equ RAMB+16
 N1 equ RAMB+17
+.endif
 N2 equ RAMB+18
 N3 equ RAMB+19
 V0 equ RAMB+20
 V1 equ RAMB+21
 R0 equ RAMB+22
 R1 equ RAMB+23
+.if 1
+; RAMB+24..26 (dvsign, dv_lo, dv_hi) -> zero page, see $C8-$CF above
+; raster loop state
+; RAMB+27..28 (hy_lo, hy_hi) -> zero page, see $C8-$CF above
+.else
 dvsign equ RAMB+24
 dv_lo  equ RAMB+25
 dv_hi  equ RAMB+26
 ; raster loop state
 hy_lo equ RAMB+27
 hy_hi equ RAMB+28
+.endif
 i_idx equ RAMB+29
 j_idx equ RAMB+30
 numv  equ RAMB+31
 hgt_lo equ RAMB+32                  ; segment height h (signed)
 hgt_hi equ RAMB+33
+.if 1
+; RAMB+34 (hh) -> zero page, see $C8-$CF above
+.else
 hh     equ RAMB+34                  ; max(h,1) (divisor, 8-bit)
+.endif
 dvr_lo equ RAMB+35
 dvr_hi equ RAMB+36
 dvl_lo equ RAMB+37
@@ -145,7 +174,11 @@ a_lo  equ $D0
 a_hi  equ $D1
 b_lo  equ $D2
 b_hi  equ $D3
+.if 1
+; RAMB+47 (row_cnt) -> zero page, see $C8-$CF above
+.else
 row_cnt equ RAMB+47
+.endif
 poly_color equ RAMB+48
 ; multiply
 mul_m equ RAMB+49

@@ -184,6 +184,32 @@ gtxt_ptr = cr0                       ; $C0-$C1 : string byte ptr (txt_ptr collid
 
 ; emit_run : draw the run [t_i0 .. X-1] (320-space cols cbx+i0 .. cbx+i1) on the
 ;   current row (sy preset) in colour txt_col, via emit_span (LR x>>1). Preserves X.
+.if 1
+.proc emit_run
+        lda t_cbx                    ; a = cbx + i0 + $8000  (bias to match emit_span)
+        clc
+        adc t_i0
+        sta a_lo
+        lda t_cbx+1
+        adc #$80
+        sta a_hi
+        txa                          ; b = cbx + (X-1) + $8000
+        sec
+        sbc #1
+        clc
+        adc t_cbx
+        sta b_lo
+        lda t_cbx+1
+        adc #$80
+        sta b_hi
+        ; poly_color/scol are set ONCE per string in do_drawstring now (text colour is
+        ; constant across the whole string), so emit_run no longer touches them per run.
+        stx tmp_lo                   ; fill_span clobbers X (ldx sy) -> save it. On a
+        jsr emit_span                ;   6502 a zp cell (3+3) beats txa/pha/pla/tax (11);
+        ldx tmp_lo                   ;   tmp_lo is free across emit_span/fill_span.
+        rts
+.endp
+.else
 .proc emit_run
         lda t_cbx                    ; a = cbx + i0 + $8000  (bias to match emit_span)
         clc
@@ -210,6 +236,7 @@ gtxt_ptr = cr0                       ; $C0-$C1 : string byte ptr (txt_ptr collid
         tax
         rts
 .endp
+.endif
 
 ;=============================================================================
 ; draw_loading : paint a "LOADING..." screen on the currently-displayed page while

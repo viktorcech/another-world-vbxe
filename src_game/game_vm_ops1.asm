@@ -20,8 +20,12 @@
 op_movconst                          ; 0x00 : var[b()] = sw()
         mfetch
         tax
+.if 1
+        m_vm_w                      ; (A = low byte on exit -- no reload)
+.else
         m_vm_w
         lda vm_s1
+.endif
         sta var_lo,x
         lda vm_s2
         sta var_hi,x
@@ -29,6 +33,37 @@ op_movconst                          ; 0x00 : var[b()] = sw()
 
 op_mov                               ; 0x01 : var[d] = var[s]
         mfetch
+.if 1
+        tax                         ; X = d (mfetch uses Y only, X survives it)
+        mfetch
+        tay                         ; Y = s
+        lda var_lo,y
+        sta var_lo,x
+        lda var_hi,y
+        sta var_hi,x
+        jmp vm_fetch
+
+op_add                               ; 0x02 : var[d] += var[s]
+        mfetch
+        tax                         ; X = d
+        mfetch
+        tay                         ; Y = s
+        lda var_lo,x
+        clc
+        adc var_lo,y
+        sta var_lo,x
+        lda var_hi,x
+        adc var_hi,y
+        sta var_hi,x
+        jmp vm_fetch
+
+op_addconst                          ; 0x03 : var[v] += sw()
+        mfetch
+        tax                         ; X = v (survives m_vm_w)
+        m_vm_w                      ; A = low byte
+        clc
+        adc var_lo,x
+.else
         sta vm_d
         mfetch
         tax
@@ -62,6 +97,7 @@ op_addconst                          ; 0x03 : var[v] += sw()
         lda var_lo,x
         clc
         adc vm_s1
+.endif
         sta var_lo,x
         lda var_hi,x
         adc vm_s2
@@ -101,10 +137,15 @@ op_jmp                               ; 0x07 : PC = w()
 
 op_install                           ; 0x08 : treq[b()] = w()
         mfetch
+.if 1
+        tax                         ; X = thread (survives m_vm_w)
+        m_vm_w                      ; A = low byte
+.else
         sta vm_d
         m_vm_w
         ldx vm_d
         lda vm_s1
+.endif
         sta treq_lo,x
         lda vm_s2
         sta treq_hi,x
@@ -114,8 +155,12 @@ op_install                           ; 0x08 : treq[b()] = w()
 
 op_djnz                              ; 0x09 : if --var[v] != 0 : PC = w()
         mfetch
+.if 1
+        tax                         ; X = v (survives m_vm_w below)
+.else
         sta vm_d
         tax
+.endif
         lda var_lo,x
         sec
         sbc #1
@@ -124,7 +169,10 @@ op_djnz                              ; 0x09 : if --var[v] != 0 : PC = w()
         sbc #0
         sta var_hi,x
         m_vm_w
+.if 1
+.else
         ldx vm_d
+.endif
         lda var_lo,x
         ora var_hi,x
         beq ?nojmp
@@ -134,9 +182,16 @@ op_djnz                              ; 0x09 : if --var[v] != 0 : PC = w()
 op_condjmp                           ; 0x0A : conditional jump (signed compare)
         mfetch
         sta vm_sub
+.if 1
+        tax                         ; (skill pass: keep the sub-op in X across the
+        mfetch                      ;   operand fetch instead of reloading it)
+        sta vm_d                    ; v : a = var[v]
+        txa
+.else
         mfetch
         sta vm_d                    ; v : a = var[v]
         lda vm_sub
+.endif
         and #$80
         beq ?not80
         mfetch                 ; b2 = var[b()]
@@ -149,8 +204,12 @@ op_condjmp                           ; 0x0A : conditional jump (signed compare)
 ?not80  lda vm_sub
         and #$40
         beq ?byte
+.if 1
+        m_vm_w                    ; b2 = sw() (word) ; A = low byte
+.else
         m_vm_w                    ; b2 = sw() (word)
         lda vm_s1
+.endif
         sta vm_b2lo
         lda vm_s2
         sta vm_b2hi
@@ -159,6 +218,13 @@ op_condjmp                           ; 0x0A : conditional jump (signed compare)
                                     ;   bank re-own needed, same as the operand
                                     ;   fetches above -- was `jsr pl_byte`)
         sta vm_b2lo
+.if 1
+        sty vm_b2hi                 ; = 0 (Y = 0 after mfetch)
+?havb   m_vm_w                    ; dst = w() -> stays in vm_s1/vm_s2 for vm_setpc
+        ; (skill pass: the old code copied dst to vm_dstlo/hi, used vm_s1/s2 as the
+        ;  diff scratch and copied dst back before vm_setpc -- 4 round-trips. The diff
+        ;  now lives in Y (lo) / vm_d (hi; v is only needed as X from here on).)
+.else
         lda #0
         sta vm_b2hi
 ?havb   m_vm_w                    ; dst = w()
@@ -166,11 +232,24 @@ op_condjmp                           ; 0x0A : conditional jump (signed compare)
         sta vm_dstlo
         lda vm_s2
         sta vm_dsthi
+.endif
         ; diff = a - b2 (signed 16-bit) ; derive eq and signed-lt
         ldx vm_d
         sec
         lda var_lo,x
         sbc vm_b2lo
+.if 1
+        tay                         ; diff lo (for eq)
+        lda var_hi,x
+        sbc vm_b2hi
+        sta vm_d                    ; diff hi (for eq)
+        bvc ?nov
+        eor #$80                    ; signed correction
+?nov    and #$80                    ; bit7 = signed (a < b2)
+        sta vm_op                   ; vm_op = $80 if a<b2 else 0  (lt flag)
+        tya
+        ora vm_d
+.else
         sta vm_s1                   ; diff lo (for eq)
         lda var_hi,x
         sbc vm_b2hi
@@ -181,6 +260,7 @@ op_condjmp                           ; 0x0A : conditional jump (signed compare)
         sta vm_op                   ; vm_op = $80 if a<b2 else 0  (lt flag)
         lda vm_s1
         ora vm_s2
+.endif
         beq ?iseq
         lda #0                      ; not equal
         beq ?eqset
@@ -189,8 +269,12 @@ op_condjmp                           ; 0x0A : conditional jump (signed compare)
         ; compute the "take" flag in A bit7 (short branches + jmp; the cmp-chain
         ; with far bmi/bpl to ?take overflowed the branch range).
         lda vm_sub
+.if 1
+        and #7                      ; (Z/N already set by the and: no `cmp #0`)
+.else
         and #7
         cmp #0
+.endif
         bne ?n0
         lda vm_d                    ; == : eq
         jmp ?decide
@@ -218,10 +302,14 @@ op_condjmp                           ; 0x0A : conditional jump (signed compare)
         ora vm_d
 ?decide and #$80
         beq ?notake
+.if 1
+        jsr vm_setpc                ; dst is still in vm_s1/vm_s2
+.else
         lda vm_dstlo
         sta vm_s1
         lda vm_dsthi
         sta vm_s2
         jsr vm_setpc
+.endif
 ?notake jmp vm_fetch
 

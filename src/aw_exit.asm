@@ -55,8 +55,8 @@ nv_len  equ *-nv_msg
 ; `sta $D400`, so the game never came up after the intro. tools/make_full_atr.py now
 ; re-derives all three from the assembled boot.bin and fails the build on a mismatch,
 ; so this can never silently drift again.
-BOOT_CURSEC equ $0809               ; bootloader.asm: cur_sec (word)
-BOOT_BUFPOS equ $080B               ;   buf_pos (128 = force a fresh sector read)
+BOOT_CURSEC equ $083A               ; bootloader.asm: cur_sec (word)
+BOOT_BUFPOS equ $083C               ;   buf_pos (128 = force a fresh sector read)
 BOOT_INIT   equ $0706               ;   boot_init (re-skips the XEX $FF $FF header)
 intro_done
 .ifdef GAME_SEC

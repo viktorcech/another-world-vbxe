@@ -6,6 +6,7 @@
 ; --- Atari hardware regs used by the harness ---
 SDMCTL          equ $022F     ; OS shadow of DMACTL
 RTCLOK3         equ $0014     ; jiffy frame counter
+SOUNDR          equ $0041     ; OS noisy-I/O flag: 0 = silent SIO transfers
 DMACTL          equ $D400
 NMIEN           equ $D40E
 PORTB           equ $D301     ; PIA port B: memory/bank control (XL/XE)

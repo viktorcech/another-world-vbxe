@@ -6,6 +6,11 @@
 ;   only RUN at $D600 -- but we still probe $D700 to tell "wrong base" apart
 ;   from "no VBXE" so the caller can report it precisely (see vbxe_err).
 ;   Check per VBXE docs: CORE_VERSION ($40)==$10 AND (MINOR_REV ($41) & $70)>=$20.
+;   NOTE: the ATR boot loader (src_game/bootloader.asm vbxe_check) carries its own
+;   copy of the $D600 half of this test so a VBXE-less machine fails ~1 s after
+;   power-on instead of after the whole intro load. Change the criteria HERE and
+;   THERE together -- tools/make_full_atr.py compares the emitted constants in
+;   boot.bin vs awintro.xex/awgame.xex and fails the build if they drift.
 ;   Returns:  C=0          -> VBXE at $D600, OK to run
 ;             C=1, A=$01   -> VBXE present but at $D700 (unsupported base)
 ;             C=1, A=$00   -> no VBXE at either base
@@ -43,13 +48,31 @@
 ; Test: SEP #$01 ($E2,$01) sets the carry on a 65C816 (SEP works in the emulation
 ; mode the CPU boots in); on a 6502/65C02 $E2 is a stable 2-byte NOP and the carry
 ; stays clear from the CLC. Result -> poly_bcb_h (0 = full, 1 = half); see equates.
+;
+; RAPIDUS MEMORY FIX (2026-09-10): Rapidus can serve $4000-$7FFF reads from its own
+; fast SRAM ("fast read" window 1, MCR bit 1 = 0). That shadow sits ABOVE the VBXE
+; MEMAC-B window at $4000 (in Altirra the Rapidus SRAM layer outranks MEMAC-B; on the
+; real card the FPGA answers before the bus), so every playlist / poly / bytecode
+; fetch through the window returned SRAM garbage: the intro hit a 0 = END byte after
+; the menu, chained into the game, and the game's VM spun on garbage under its
+; "LOADING..." text. Seen with Rapidus MCR = $E0 (fast0..3). Everything we READ from
+; VRAM goes through MEMAC-B, and MEMAC-A ($8000) is write-only for us, so it is
+; enough to force window 1 SLOW: MCR |= $02. MCR lives at $FF0080 (the Rapidus
+; firmware writes it there too), reachable only with 65816 long addressing -- the
+; two opcodes are emitted as bytes ($AF = LDA long, $8F = STA long) and sit on the
+; carry-set path, i.e. they only ever execute on a 65C816. Windows 0/2/3 stay as
+; configured (code at $2000, tables at $9000-$BFFF: write-through keeps SRAM coherent).
 ;-----------------------------------------------------------------------------
 .proc detect_cpu
         clc
         .byte $E2,$01               ; SEP #$01 (816: C=1) / NOP #imm (6502: C unchanged=0)
+        bcc ?stock
+        .byte $AF,$80,$00,$FF       ; lda.l $FF0080 -- Rapidus MCR
+        ora #$02                    ; bit1 = 1 : $4000-$7FFF SLOW (no SRAM shadow over MEMAC-B)
+        .byte $8F,$80,$00,$FF       ; sta.l $FF0080
         lda #0                      ; 65C816 (Rapidus) -> full detail
-        bcs ?set
-        lda #1                      ; stock 6502 -> half vertical res
+        beq ?set                    ; (A = 0 -> always taken)
+?stock  lda #1                      ; stock 6502 -> half vertical res
 ?set    sta poly_bcb_h
         rts
 .endp
@@ -423,6 +446,95 @@ bcb_tmpl
 ;   scol < $10  : solid colour
 ;   scol = $10  : transparent (dest |= 8)  via BLT_OR
 ;   scol > $10  : copy the same pixels from page 0 (background shows through)
+.if 1
+.proc fill_span
+        ; --- address + width math FIRST : touches only registers, so it runs
+        ;     CONCURRENTLY with the still-running previous blit (pipelining). ---
+        ; skill pass 2026-09-09 ("no sta tmp / lda tmp round-trip"): the offset is
+        ; composed into Y (lo) / X (hi) and written to the BCB straight from the
+        ; registers after the busy wait -- the zp_dlo/zp_dmid store + reload (and the
+        ; second reload in copy mode) are gone: -8 cyc per span. The busy loop only
+        ; touches A. Nothing else read zp_dlo/zp_dmid.
+        ldx sy                      ; offset = row_lut[sy] + sx
+.ifdef HIRES_CAP
+        ldy hires
+        beq ?lrlut
+        lda row_lo2,x               ; SR : y*320-$8000 LUT
+        clc
+        adc sx_lo
+        tay
+        lda row_hi2,x
+        adc sx_hi
+        tax
+        jmp ?lutok
+?lrlut
+.endif
+        lda row_lo,x
+        clc
+        adc sx_lo
+        tay                         ; Y = offset lo
+        lda row_hi,x
+        adc sx_hi
+        tax                         ; X = offset mid
+.ifdef HIRES_CAP
+?lutok
+.endif
+        ; --- ONLY NOW wait for the blitter, then edit the BCB ---
+?bw     lda VBXE_BL_BUSY            ; inlined blit_idle (saves the jsr/rts) --
+        bne ?bw                     ;   the BCB must be idle before editing
+        ; dst low/mid = offset (cbase low/mid are 0).  DST_ADDR+2 (page) and HEIGHT
+        ; are set ONCE per shape in op_drawpoly -- constant for every span -- so
+        ; they are NOT rewritten here.
+        sty BCB+BCB_DST_ADDR
+        stx BCB+BCB_DST_ADDR+1
+        lda slen_lo                 ; emit_span already delivers WIDTH-1
+        sta BCB+BCB_WIDTH
+        lda slen_hi
+        sta BCB+BCB_WIDTH+1
+        ; --- colour mode (cache: AND/XOR/CTRL only change when scol changes) ---
+        lda scol
+        cmp #$11
+        bcs ?copy                   ; copy mode: src changes per span -> always patch
+        cmp last_scol
+        beq ?fire                   ; same solid/transparent colour -> BCB mode is set
+        sta last_scol
+        cmp #$10
+        beq ?transp
+        jmp ?solid
+?copy   ; copy from page 0 : src = offset (page 0 base = 0) -- patched every span
+        sty BCB+BCB_SRC_ADDR        ; (Y/X still = the offset, see above)
+        stx BCB+BCB_SRC_ADDR+1
+        lda #0
+        sta BCB+BCB_SRC_ADDR+2
+        lda #1
+        sta BCB+BCB_SRC_STEPX
+        lda #$FF
+        sta BCB+BCB_AND
+        lda #0
+        sta BCB+BCB_XOR
+        lda #BLT_COPY
+        sta BCB+BCB_CTRL
+        lda #$11                    ; mark mode=copy so a later solid/transp re-patches
+        sta last_scol
+        jmp ?fire
+?transp lda #0
+        sta BCB+BCB_AND
+        lda #$08
+        sta BCB+BCB_XOR
+        lda #BLT_OR
+        sta BCB+BCB_CTRL
+        jmp ?fire
+?solid  lda #0
+        sta BCB+BCB_AND
+        lda scol
+        sta BCB+BCB_XOR
+        lda #BLT_COPY
+        sta BCB+BCB_CTRL
+?fire   lda #1                      ; inlined fire_fill (start, NO wait -- the next
+        sta VBXE_BL_START           ;   BCB edit is gated by its own leading idle)
+        rts
+.endp
+.else
 .proc fill_span
         ; --- address + width math FIRST : touches only ZP scratch, so it runs
         ;     CONCURRENTLY with the still-running previous blit (pipelining). ---
@@ -509,6 +621,7 @@ bcb_tmpl
         sta VBXE_BL_START           ;   BCB edit is gated by its own leading idle)
         rts
 .endp
+.endif
 
 ; fire_fill : start the blitter and RETURN IMMEDIATELY (no wait). BL_ADR is loaded
 ;   once at init (always BCBF_V), so per fire we only write BL_START. The blit then

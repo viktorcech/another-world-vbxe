@@ -184,8 +184,20 @@ snd_play
 ?ours   lda POKMSK                   ; acknowledge + re-arm Timer 1 (POKMSK-based:
         and #$FE                     ;   SIO owns POKMSK serial bits during loads)
         sta IRQEN
+.if 1
+        ora #$01                     ; = POKMSK again: A still holds POKMSK & $FE, and
+        sta IRQEN                    ;   bit 0 (Timer 1 enable) IS 1 on this path -- the
+                                     ;   ?ours test above saw Timer 1 PENDING, and POKEY
+                                     ;   only latches a pending bit while its IRQEN bit
+                                     ;   is set; every writer of POKMSK bit 0 (snd_play,
+                                     ;   ?off, snd_mute) writes IRQEN in the same breath,
+                                     ;   which drops the pending bit -> such an IRQ chains
+                                     ;   as "not ours". (skill pass: no reload of A, -2 cyc
+                                     ;   per IRQ at up to 21 kHz)
+.else
         lda POKMSK
         sta IRQEN
+.endif
 body    lda snd_active               ; cv_irq jumps in here (shared from now on)
         beq ?off                     ; 0 = stray after silence -> mute + disable
         cmp #2
@@ -433,20 +445,24 @@ cv_rest dta $FF                      ; RESTRICT as pm_try found it ($FF = not us
         cpx ?len
         bne ?ld
         beq ?ent                     ; always
-?done   lda #0                       ; silence the two channels this player does
-cz2     sta COVOXL+2                 ;   NOT drive: on a 4-channel card they sum
-cz3     sta COVOXL+3                 ;   into the same outputs ($D282 -> R,
-                                     ;   $D283 -> L, on a PokeyMAX too), and
-                                     ;   probe 3 left $80 in ch4 -- its address
-                                     ;   has to be $D28F to hit SKCTL on a plain
-                                     ;   POKEY, and $D28F & 3 = 3. Left there it
-                                     ;   is a permanent DC offset on the left
-                                     ;   channel. Safe: reaching here proves
-                                     ;   these are not POKEY registers.
-        lda #$80                     ; park both ports + the pending byte at mid rail
-cz0     sta COVOXL
-cz1     sta COVOXR
-        sta cv_next
+?done   lda #$80                     ; park ALL FOUR channels + the pending byte at
+cz2     sta COVOXL+2                 ;   MID RAIL. On a 4-channel card the pairs
+cz3     sta COVOXL+3                 ;   SUM into one output each ($D282 -> R,
+cz0     sta COVOXL                   ;   $D283 -> L, on a PokeyMAX and in
+cz1     sta COVOXR                   ;   Altirra's Covox device alike), so an
+        sta cv_next                  ;   undriven channel has to sit on the same
+                                     ;   $80 the driven one centres on: L = ch0 +
+                                     ;   ch3 then centres at $100 of $000-$1FE.
+                                     ;   Writing 0 there (what this used to do)
+                                     ;   centres it at $80 -- a half-scale DC
+                                     ;   offset that costs the analogue stage
+                                     ;   half its headroom on a plain R-2R card,
+                                     ;   i.e. on the p-covox bases $D500/$D600/
+                                     ;   $D700. Only a PokeyMAX VOLONLY channel
+                                     ;   reads 0 as "silent"; a resistor ladder
+                                     ;   reads it as the bottom rail.
+                                     ;   Safe: reaching here proves these are not
+                                     ;   POKEY registers.
         rts
 ?len    dta 0
 .endp
@@ -513,8 +529,13 @@ cv_irqh dta >cv_irq
 ?ours   lda POKMSK                   ; acknowledge + re-arm Timer 1
         and #$FE
         sta IRQEN
+.if 1
+        ora #$01                     ; = POKMSK (bit 0 is 1 on the ?ours path, see snd_irq)
+        sta IRQEN
+.else
         lda POKMSK
         sta IRQEN
+.endif
         lda cv_next
 cvw0    sta COVOXL                   ; SMC oper : base+0 / base+1 of whichever
 cvw1    sta COVOXR                   ;   card the intro's menu picked (cv_set_base)

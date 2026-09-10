@@ -25,7 +25,7 @@ op_resettask                         ; 0x0C : reset/pause a thread range
         sta vm_s2                   ; last
         mfetch
         sta vm_op                   ; typ
-        lda vm_s2
+        lda vm_s2                   ; (zp reload, 3 cyc -- cheaper than tax/txa on a 6502)
         cmp vm_s1
         bcc ?rtdone                 ; last < first -> nothing
         lda #1

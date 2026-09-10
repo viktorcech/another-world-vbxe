@@ -65,6 +65,8 @@ game_start
         sta DMACTL
         sta COLOR4                     ; black border
         sta COLBK
+        sta SOUNDR                     ; quiet SIO for the part loads; needed when the xex
+                                       ;   is started from DOS (the ATR boot already set it)
         cli
 
         jsr detect_vbxe
@@ -181,7 +183,8 @@ game_start
         jsr CIOV
 ?halt   jmp ?halt
 nv_edev dta c'E:',$9B
-nv_msg  dta c'NEEDS VBXE',$9B
+nv_msg  dta c'VBXE NOT DETECTED!',$9B  ; ONE canonical text everywhere (loader,
+                                       ;   intro, game) -- make_full_atr.py checks
 nv_len  equ *-nv_msg
 .endp
 

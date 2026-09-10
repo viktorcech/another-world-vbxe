@@ -11,7 +11,8 @@ the sounds are baked into the intro build here.
 
 They are real game SFX: type-0 resources that the GAME parts' bytecode requests
 via op_sound (make_game_atr.collect_sound_freqs), minus anything the intro
-itself already uses, resampled at the freq the game asks for.
+itself already uses, resampled at the freq the game asks for and NORMALISED --
+see normalise() for why the raw levels are unusable as a listening test.
 
 Where they go: the MUSIC blob ends part-way through its last VRAM bank ($12) and
 the rest of that bank is dead space -- the IRQ stops on a byte count, so nothing
@@ -52,6 +53,39 @@ MIN_S = 0.12                   #   enough to fit several -- and to not drone on
 WANT = 8                       # how many to offer the random pick
 
 
+def normalise(sig):
+    """Lift a resampled sound to full scale before the nibble packing.
+
+    pack_nibbles keeps the top 4 bits of a signed 8-bit sample, i.e. it divides
+    whatever amplitude the source has by 16. The game's sounds are QUIET at the
+    source -- of the eight picked here six sit at an RMS of 8..25 out of +-128 --
+    so after the shift they are a signal of about +-1 nibble: one or two bits of
+    sound buried under three bits of quantisation noise. Played back that is not
+    the effect, it is a screech, and the menu's test key exists precisely to be
+    judged by ear. (It was: "skreky a divne zvuky" on a covox that turned out to
+    be wired and working perfectly.)
+
+    In the GAME the plain shift is right: op_sound carries a per-sound volume,
+    several voices mix, and the levels are built around that. Here there is no
+    mix and no volume -- one sound plays alone, at full volume, to answer "is my
+    covox working?" -- so the only thing that matters is that it be clearly
+    audible.
+
+    Scale so the 99th percentile of |sample| reaches full scale rather than the
+    peak: a single spike defeats peak normalisation (#87 peaks at 71 with an RMS
+    of 8, so peak-scaling lifts it by only 1.8x), while clipping the loudest 1%
+    costs nothing audible and brings every sound into the same range. Measured
+    over the eight baked sounds this moves the nibble RMS from 0.65..3.33 to
+    1.78..3.40 -- the quiet ones gain 2-3 bits of real signal.
+    """
+    a = sorted(abs(s) for s in sig)
+    if not a:
+        return sig
+    ref = max(1.0, a[int(0.99 * (len(a) - 1))])     # pack_nibbles clamps the rest
+    g = 127.0 / ref
+    return [s * g for s in sig]
+
+
 def main():
     music = os.path.join(OUT, 'intro_music.bin')
     if not os.path.exists(music):
@@ -90,7 +124,8 @@ def main():
         if len(sig) / rate < MIN_S:
             continue                                        # a 50 ms click
         src = sig[:int(MAX_S * rate) + 1]
-        packed = pack_nibbles(resample(src, rate, int(len(src) * POKEY_RATE / rate)))
+        packed = pack_nibbles(normalise(
+            resample(src, rate, int(len(src) * POKEY_RATE / rate))))
         cand.append((res, fq, packed))
 
     if not cand:

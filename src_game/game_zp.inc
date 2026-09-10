@@ -26,3 +26,12 @@ g_scaled_hi equ cr1                 ; $C1   (mul_zoom output hi)
 g_x0        equ cr2                 ; $C2-$C3 (do_fill bbox origin x)
 g_y0        equ cl0                 ; $C4-$C5 (do_fill bbox origin y)
 g_vidx      equ cl2                 ; $C6   (do_fill vertex index)
+.if 1
+; skill pass 2026-09-09: two more calc_step slope cells in GAME-free zero page (the
+; intro's replayer does not use poff/$88-$89 either, but the intro keeps the shared
+; RAMB N0/N2 -- this file is game-only). N1/hh/dv/dvsign/hy/row_cnt moved for BOTH
+; builds in src/aw_equates.inc ($C8-$CF).
+g_N0        equ $88                 ; (was poff, unused) slope byte 0
+g_N2        equ $89                 ; slope byte 2
+.else
+.endif

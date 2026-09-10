@@ -449,17 +449,27 @@ cv_rest dta $FF                      ; RESTRICT as pm_try found it ($FF = not us
         cpx ?len
         bne ?ld
         beq ?ent                     ; always
-?done   lda #0                       ; silence the two channels this player does
-cz2     sta COVOXL+2                 ;   NOT drive. On a 4-channel card they sum
-cz3     sta COVOXL+3                 ;   into the same two outputs the driven
-                                     ;   pair does ($D282 -> R, $D283 -> L, both
-                                     ;   here and on a PokeyMAX), and probe 3
-                                     ;   just left $80 in ch4: its address HAS
-                                     ;   to be $D28F to hit SKCTL on a plain
-                                     ;   POKEY, and $D28F & 3 = 3. Left alone
-                                     ;   that is a permanent DC offset on the
-                                     ;   left channel -- half the headroom gone
-                                     ;   and the stereo image pulled off centre.
+?done   lda #$80                     ; park the two channels this player does NOT
+cz2     sta COVOXL+2                 ;   drive at MID RAIL -- the same $80 the
+cz3     sta COVOXL+3                 ;   driven pair centres on.
+                                     ;   On a 4-channel card the pairs SUM into
+                                     ;   one output each ($D282 -> R, $D283 -> L,
+                                     ;   on a PokeyMAX and in Altirra's Covox
+                                     ;   device alike): L = ch0 + ch3, so with
+                                     ;   ch3 at $80 the sum centres at $100 of
+                                     ;   $000-$1FE -- dead centre. Writing 0 here
+                                     ;   (what this used to do) centres it at $80
+                                     ;   instead: a half-scale DC offset that
+                                     ;   costs the analogue stage half its
+                                     ;   headroom on a plain R-2R card, which is
+                                     ;   what the p-covox bases $D500/$D600/$D700
+                                     ;   are. Only a PokeyMAX VOLONLY channel
+                                     ;   reads 0 as "silent"; a resistor ladder
+                                     ;   reads it as the bottom rail.
+                                     ;   Probe 3 leaves $80 in ch4 already (its
+                                     ;   address HAS to be $D28F to hit SKCTL on
+                                     ;   a plain POKEY, and $D28F & 3 = 3) -- so
+                                     ;   that leftover was centred all along.
                                      ;   Safe to write: getting here means these
                                      ;   addresses have been PROVEN not to be
                                      ;   POKEY (where $D283 would be AUDC2, the

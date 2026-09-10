@@ -18,6 +18,21 @@
 ;=============================================================================
 draw_bg
         sta vm_s2                   ; op = high byte of the offset word
+.if 1
+        mfetch                      ; low byte -> off = word * 2, shifted in A
+        asl @                       ;   (skill pass: was asl/rol in memory + copy)
+        sta dr_off
+        lda vm_s2
+        rol @
+        sta dr_off+1
+        mfetch                 ; x = b()  (0..255)
+        sta dr_x
+        sty dr_x+1                  ; = 0 (Y = 0 after mfetch)
+        mfetch                 ; y = b()
+        sta dr_y
+        sty dr_y+1
+        sec                         ; h = y - 199 ; if h>0 : y=199 ; x+=h  (A still = y)
+.else
         mfetch
         sta vm_s1                   ; low byte
         asl vm_s1                   ; off = word * 2
@@ -36,6 +51,7 @@ draw_bg
         sta dr_y+1
         lda dr_y                    ; h = y - 199 ; if h>0 : y=199 ; x+=h
         sec
+.endif
         sbc #199
         bcc ?noh
         beq ?noh
@@ -51,6 +67,13 @@ draw_bg
         sta dr_x+1
 ?noh    lda #64                     ; zoom = 64
         sta dr_zoom
+.if 1
+        sty dr_zoom+1               ; = 0 (Y = 0 since the last mfetch; pl_wrap keeps it)
+        sty poly_base_adj           ; video1
+        sty psp
+        lda #$FF
+        sta dr_col
+.else
         lda #0
         sta dr_zoom+1
         lda #$FF
@@ -58,6 +81,7 @@ draw_bg
         lda #0
         sta poly_base_adj           ; video1
         sta psp
+.endif
         jmp do_draw
 
 ;=============================================================================
@@ -65,6 +89,28 @@ draw_bg
 ;=============================================================================
 draw_sprite
         sta vm_op                   ; save opcode
+.if 1
+        m_vm_w                    ; off = w() * 2  (A = low byte; shifted in A)
+        asl @
+        sta dr_off
+        lda vm_s2
+        rol @
+        sta dr_off+1
+        mfetch                 ; x = b()
+        sta dr_x
+        sty dr_x+1                  ; = 0 (Y = 0 after mfetch)
+        lda vm_op                   ; bits 5:4 decide the x form (one load, skill pass)
+        and #$30
+        bne ?xnw
+        lda dr_x                    ; $00 : x = (x<<8) | b()  (big-endian word)
+        sta dr_x+1
+        mfetch
+        sta dr_x
+        jmp ?xdone
+?xnw    cmp #$10
+        bne ?xhi
+        ldx dr_x                    ; $10 : x = var[x]
+.else
         m_vm_w                    ; off = w() * 2
         asl vm_s1
         rol vm_s2
@@ -88,11 +134,31 @@ draw_sprite
         sta dr_x
         jmp ?xdone
 ?xvar   ldx dr_x                    ; x = var[x]
+.endif
         lda var_lo,x
         sta dr_x
         lda var_hi,x
         sta dr_x+1
         jmp ?xdone
+.if 1
+?xhi    cmp #$30                    ; $20 : x as is ; $30 : x += 256
+        bne ?xdone
+        inc dr_x+1
+?xdone  mfetch                      ; y = b()  (mid-opcode -> mfetch, no bank re-own)
+        sta dr_y
+        sty dr_y+1                  ; = 0
+        lda vm_op                   ; bits 3:2 decide the y form
+        and #$0C
+        bne ?ynw
+        lda dr_y                    ; $00 : y = (y<<8) | b()
+        sta dr_y+1
+        mfetch
+        sta dr_y
+        jmp ?ydone
+?ynw    cmp #$04
+        bne ?ydone                  ; $08 / $0C : y as is
+        ldx dr_y                    ; $04 : y = var[y]
+.else
 ?xhi    lda vm_op                   ; op&0x20 : if op&0x10 -> x += 256
         and #$10
         beq ?xdone
@@ -113,12 +179,23 @@ draw_sprite
         sta dr_y
         jmp ?ydone
 ?yvar   ldx dr_y                    ; y = var[y]
+.endif
         lda var_lo,x
         sta dr_y
         lda var_hi,x
         sta dr_y+1
 ?ydone  lda #64                     ; zoom = 64 ; default video1
         sta dr_zoom
+.if 1
+        sty dr_zoom+1               ; = 0 (Y = 0 after the last mfetch)
+        sty poly_base_adj
+        lda vm_op                   ; bits 1:0 decide the zoom form
+        and #3
+        beq ?zdone                  ; $0 : zoom stays 64
+        cmp #1
+        bne ?z2
+        mfetch                 ; $1 : zoom = var[b()]
+.else
         lda #0
         sta dr_zoom+1
         sta poly_base_adj
@@ -129,12 +206,26 @@ draw_sprite
         and #1
         beq ?zdone                  ; zoom stays 64
         mfetch                 ; zoom = var[b()]
+.endif
         tax
         lda var_lo,x
         sta dr_zoom
         lda var_hi,x
         sta dr_zoom+1
         jmp ?zdone
+.if 1
+?z2     cmp #2
+        bne ?z3
+        mfetch                      ; $2 : zoom = b()  (mid-opcode -> mfetch)
+        sta dr_zoom
+        sty dr_zoom+1
+        jmp ?zdone
+?z3     lda #8                      ; $3 : use video2 (shared shapes)
+        sta poly_base_adj
+?zdone  lda #$FF
+        sta dr_col
+        sty psp                     ; = 0
+.else
 ?z2     lda vm_op
         and #1
         beq ?zbyte
@@ -149,6 +240,7 @@ draw_sprite
         sta dr_col
         lda #0
         sta psp
+.endif
         ; fall through to do_draw
 
 ;=============================================================================

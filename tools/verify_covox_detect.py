@@ -156,7 +156,7 @@ class Covox(Pokey):
         self.pass_writes = (base & 0xFF00) != 0xD200
         self.name = 'covox $%04X-%04X %s' % (
             self.lo, self.hi, '4ch' if channels == 4 else 'mono')
-        self.covox = [0, 0, 0, 0]
+        self.covox = [0x80] * 4         # ColdReset/Init fill mVolume with $80
 
     def write(self, a, v):
         if self.lo <= a <= self.hi:
@@ -422,15 +422,23 @@ def run_all(mem, lab):
                                     % (hw.name, hw.skctl))
             if not covox:
                 continue
-            # probe 3 has to write $D28F -- that is the SKCTL mirror -- and
-            # $D28F & 3 = 3, so on a 4-channel card it lands in ch4 (LEFT).
-            # snd_go_covox must scrub that, or the left channel carries a
-            # permanent +$80 and clips the moment the samples get loud.
+            # On a 4-channel card the channels SUM in pairs into one output
+            # each (L = ch0 + ch3, R = ch1 + ch2), so the two this player never
+            # drives must sit on the SAME mid rail the driven pair centres on:
+            # with ch3 = $80 the sum centres at $100 of $000-$1FE, dead centre.
+            # Parking them at 0 centres it at $80 instead -- a half-scale DC
+            # offset, i.e. half the analogue headroom gone on a plain R-2R
+            # ladder, which is what the p-covox bases $D500/$D600/$D700 are.
+            # Only a PokeyMAX VOLONLY register reads 0 as "silent".
+            # Probe 3's $D28F write ($D28F & 3 = 3 -> ch4) leaves $80 there,
+            # which is already correct; what matters is that a channel holding
+            # a power-on value gets overwritten at all.
             #  (a mono card cannot be unbalanced -- every write hits all four)
             if ch == 4:
-                check(hw.covox[2] == 0 and hw.covox[3] == 0,
-                      '%s: undriven channels left at $%02X/$%02X, want 0/0 -- '
-                      'probe 3 left a DC offset in one of them'
+                check(hw.covox[2] == 0x80 and hw.covox[3] == 0x80,
+                      '%s: undriven channels left at $%02X/$%02X, want $80/$80 -- '
+                      'they sum into the driven outputs, so anything off mid rail '
+                      'is a DC offset that eats the analogue headroom'
                       % (hw.name, hw.covox[2], hw.covox[3]))
             if 'snd_mute' in lab:
                 cpu.run(lab['snd_mute'])     # exercises the SMC'd mute as well
@@ -443,6 +451,11 @@ def run_all(mem, lab):
                 check(hw.covox[0] == 0x80,
                       '%s: after snd_mute the DAC sits at $%02X, want $80 (mid '
                       'rail -- anything else is a click)' % (hw.name, hw.covox[0]))
+                check(hw.left == 0x100 and hw.right == 0x100,
+                      '%s: after snd_mute the SUMMED output sits at $%03X/$%03X, '
+                      'want $100/$100 -- both channels feeding an output have to '
+                      'be at mid rail or the card idles off centre'
+                      % (hw.name, hw.left, hw.right))
 
     return fails
 

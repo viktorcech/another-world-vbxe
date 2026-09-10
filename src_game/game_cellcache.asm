@@ -781,6 +781,236 @@ cc_arhi    = $9EA6                 ; (1) region base-hi temp (set_arena)
 ;   page, clipped to the 160x200 page. Cell fields are read from the entry
 ;   (the index bank is still selected on entry to this routine).
 ;=============================================================================
+.if 1
+.proc cc_blit
+        ; geometry from the entry
+        ldy #9
+        lda (cc_ptr),y              ; w-1
+        clc
+        adc #1
+        sta cc_w
+        iny
+        lda (cc_ptr),y              ; h-1
+        clc
+        adc #1
+        sta cc_h
+        iny                         ; +11 ax (signed 8)
+        lda (cc_ptr),y
+        sta cc_t0
+        and #$80                    ; sign-extend
+        beq ?sx1
+        lda #$FF
+        dta $2C                     ; BIT abs: skip the lda #0
+?sx1    lda #0
+        sta cc_t0+1
+        iny                         ; +12 ay (signed 8)
+        lda (cc_ptr),y
+        sta cc_t1
+        and #$80
+        beq ?sy1
+        lda #$FF
+        dta $2C
+?sy1    lda #0
+        sta cc_t1+1
+        ; dest x0 (bytes) = ax + (dr_x - par)>>1   (signed)
+        lda dr_x
+        and #1
+        sta cc_dx                   ; par (reuse cc_dx as temp)
+        lda dr_x
+        sec
+        sbc cc_dx
+        sta cc_dx
+        lda dr_x+1
+        sbc #0
+        sta cc_dx+1
+        cmp #$80                    ; arithmetic >>1
+        ror cc_dx+1
+        ror cc_dx
+        lda cc_dx
+        clc
+        adc cc_t0
+        sta cc_dx
+        lda cc_dx+1
+        adc cc_t0+1
+        sta cc_dx+1
+        ; dest y0 = ay + dr_y (signed)
+        lda dr_y
+        clc
+        adc cc_t1
+        sta cc_dy
+        lda dr_y+1
+        adc cc_t1+1
+        sta cc_dy+1
+        ; clip -> cc_sk (src skip), cc_bw/cc_bh, clamp cc_dx/cc_dy
+        lda #0
+        sta cc_sk
+        sta cc_sk+1
+        lda cc_w
+        sta cc_bw
+        lda cc_h
+        sta cc_bh
+        ; X: left
+        lda cc_dx+1
+        bpl ?xr                     ; >= 0
+        lda #0                      ; skipx = -dx
+        sec
+        sbc cc_dx
+        cmp cc_bw
+        bcs ?out1                   ; fully left of the page
+        sta cc_sk                   ; src skip (bytes)
+        lda cc_bw
+        sec
+        sbc cc_sk
+        sta cc_bw
+        lda #0
+        sta cc_dx
+        sta cc_dx+1
+?xr     ; X: right (dx >= 0 here; dx+bw <= 160 ?)
+        lda cc_dx+1
+        bne ?out1                   ; dx >= 256 -> off the page
+        lda cc_dx
+        cmp #SCRW
+        bcs ?out1                   ; (not taken -> C = 0 is proven: no clc needed)
+        adc cc_bw
+        bcs ?xcl                    ; > 255 -> clip
+        cmp #SCRW+1
+        bcc ?yt
+?xcl    lda #SCRW                   ; bw = 160 - dx
+        sec
+        sbc cc_dx
+        sta cc_bw
+        jmp ?yt
+?out1   jmp ?out                    ; near trampoline (?out is far)
+?yt     ; Y: top
+        lda cc_dy+1
+        bpl ?yb
+        lda #0
+        sec
+        sbc cc_dy
+        cmp cc_bh
+        bcs ?out2
+        sta cc_t0                   ; skipy
+        lda cc_bh
+        sec
+        sbc cc_t0
+        sta cc_bh
+        ; src skip += skipy * w
+        lda cc_w
+        jsr fmul_seta
+        ldx cc_t0
+        jsr fmul_b
+        lda cc_sk
+        clc
+        adc qp_lo
+        sta cc_sk
+        lda cc_sk+1
+        adc qp_hi
+        sta cc_sk+1
+        lda #0
+        sta cc_dy
+        sta cc_dy+1
+?yb     ; Y: bottom
+        lda cc_dy+1
+        bne ?out2
+        lda cc_dy
+        cmp #SCRH
+        bcs ?out2                   ; (not taken -> C = 0 is proven: no clc needed)
+        adc cc_bh
+        bcs ?ycl
+        cmp #SCRH+1
+        bcc ?go
+?ycl    lda #SCRH
+        sec
+        sbc cc_dy
+        sta cc_bh
+        jmp ?go
+?out2   jmp ?out                    ; near trampoline
+?go     ; src = cell + cc_sk ; dst = page + dy*160 + dx
+        ldy #6
+        lda (cc_ptr),y
+        clc
+        adc cc_sk
+        sta cc_t0
+        iny
+        lda (cc_ptr),y
+        adc cc_sk+1
+        sta cc_t0+1
+        iny
+        lda (cc_ptr),y
+        adc #0
+        sta cc_t1                   ; src hi
+        jsr blit_idle               ; now edit the BCB
+        lda cc_t0
+        sta BCB+BCB_SRC_ADDR
+        lda cc_t0+1
+        sta BCB+BCB_SRC_ADDR+1
+        lda cc_t1
+        sta BCB+BCB_SRC_ADDR+2
+        lda cc_w
+        sta BCB+BCB_SRC_STEPY
+        lda #0
+        sta BCB+BCB_SRC_STEPY+1
+        lda #1
+        sta BCB+BCB_SRC_STEPX
+        ldx cc_dy
+        lda row_lo,x                ; page offset = row_lut[dy] + dx + ROWBIAS
+        clc
+        adc cc_dx
+        sta cc_t0
+        lda row_hi,x
+        adc #>ROWBIAS
+        sta cc_t0+1
+        lda cc_t0
+        sta BCB+BCB_DST_ADDR
+        lda cc_t0+1
+        sta BCB+BCB_DST_ADDR+1
+        lda cbase+2                 ; current draw page
+        sta BCB+BCB_DST_ADDR+2
+        lda #<SCRW
+        sta BCB+BCB_DST_STEPY
+        lda #>SCRW
+        sta BCB+BCB_DST_STEPY+1
+        ldx cc_bw
+        dex
+        stx BCB+BCB_WIDTH
+        lda #0
+        sta BCB+BCB_WIDTH+1
+        ldx cc_bh
+        dex
+        stx BCB+BCB_HEIGHT
+        ; --- the STENCIL+XOR blit pair (both skip processed-source == 0, so
+        ; empty cell bytes never touch the page). The blitter stencil tests
+        ; (and writes) the POST-AND/XOR value, so colour 0 cannot be written
+        ; directly; and BLT_AND writes 0 even for source 0 (Altirra vbxe.cpp:
+        ; mode 4 has no transparency -- caused black boxes). Instead, with
+        ; cell bytes = colour|$F0 (never 0):
+        ;   blit 1, BSTENCIL, AND=$F0: shape bytes -> dest = $F0; empty skips.
+        ;   blit 2, BLT_XOR,  AND=$FF: c = colour|$F0 (nonzero for ALL colours
+        ;           incl. 0) -> dest = $F0 ^ (colour|$F0) = colour (the $F0 and
+        ;           colour bits are disjoint); empty c=0 skips.
+        lda #$F0
+        sta BCB+BCB_AND
+        lda #0
+        sta BCB+BCB_XOR
+        lda #BLT_BSTENCIL
+        sta BCB+BCB_CTRL
+        jsr fire_fill
+        jsr blit_idle               ; same geometry -> patch only AND/CTRL
+        lda #$FF
+        sta BCB+BCB_AND
+        lda #BLT_XOR
+        sta BCB+BCB_CTRL
+        jsr fire_fill
+        jsr blit_idle               ; restore the fields the span path assumes
+        lda #<SCRW                  ;   constant (SRC_STEPY; copy-mode spans)
+        sta BCB+BCB_SRC_STEPY
+        lda #>SCRW
+        sta BCB+BCB_SRC_STEPY+1
+        lda #$FF                    ; mode fields clobbered -> re-patch next span
+        sta last_scol
+?out    rts
+.endp
+.else
 .proc cc_blit
         ; geometry from the entry
         ldy #9
@@ -1011,5 +1241,6 @@ cc_arhi    = $9EA6                 ; (1) region base-hi temp (set_arena)
         sta last_scol
 ?out    rts
 .endp
+.endif
 
         ert *>$B000                 ; the $AA00 gap ends at the VM state block

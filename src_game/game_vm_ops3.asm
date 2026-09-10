@@ -22,6 +22,25 @@ op_drawstring                        ; 0x12 : DRAWTEXT -> game_text.asm (intro g
 
 op_sub                               ; 0x13 : var[d] -= var[s]
         mfetch
+.if 1
+        tax                         ; X = d (mfetch uses Y only, X survives it)
+        mfetch
+        tay                         ; Y = s
+        lda var_lo,x
+        sec
+        sbc var_lo,y
+        sta var_lo,x
+        lda var_hi,x
+        sbc var_hi,y
+        sta var_hi,x
+        jmp vm_fetch
+
+op_and                               ; 0x14 : var[v] &= w()
+        mfetch
+        tax                         ; X = v (survives m_vm_w)
+        m_vm_w                      ; A = low byte
+        and var_lo,x
+.else
         sta vm_d
         mfetch
         tax
@@ -42,6 +61,7 @@ op_and                               ; 0x14 : var[v] &= w()
         ldx vm_d
         lda var_lo,x
         and vm_s1
+.endif
         sta var_lo,x
         lda var_hi,x
         and vm_s2
@@ -50,11 +70,17 @@ op_and                               ; 0x14 : var[v] &= w()
 
 op_or                                ; 0x15 : var[v] |= w()
         mfetch
+.if 1
+        tax                         ; X = v (survives m_vm_w)
+        m_vm_w                      ; A = low byte
+        ora var_lo,x
+.else
         sta vm_d
         m_vm_w
         ldx vm_d
         lda var_lo,x
         ora vm_s1
+.endif
         sta var_lo,x
         lda var_hi,x
         ora vm_s2
@@ -63,6 +89,13 @@ op_or                                ; 0x15 : var[v] |= w()
 
 op_shl                               ; 0x16 : var[v] <<= (w() & 15)
         mfetch
+.if 1
+        tax                         ; X = v (survives m_vm_w)
+        m_vm_w                      ; A = low byte
+        and #15
+        tay
+        beq ?done
+.else
         sta vm_d
         m_vm_w
         lda vm_s1
@@ -70,6 +103,7 @@ op_shl                               ; 0x16 : var[v] <<= (w() & 15)
         tay
         beq ?done
         ldx vm_d
+.endif
 ?lp     asl var_lo,x
         rol var_hi,x
         dey
@@ -78,6 +112,13 @@ op_shl                               ; 0x16 : var[v] <<= (w() & 15)
 
 op_shr                               ; 0x17 : var[v] = (var[v]&0xFFFF) >> (w() & 15)
         mfetch
+.if 1
+        tax                         ; X = v (survives m_vm_w)
+        m_vm_w                      ; A = low byte
+        and #15
+        tay
+        beq ?done
+.else
         sta vm_d
         m_vm_w
         lda vm_s1
@@ -85,6 +126,7 @@ op_shr                               ; 0x17 : var[v] = (var[v]&0xFFFF) >> (w() &
         tay
         beq ?done
         ldx vm_d
+.endif
 ?lp     lsr var_hi,x
         ror var_lo,x
         dey

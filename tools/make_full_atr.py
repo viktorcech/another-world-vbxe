@@ -144,6 +144,40 @@ def main():
     print(f"chain: cur_sec ${lo_a:04X}<-{game_sec}  buf_pos ${bp_a:04X}<-128  "
           f"jmp ${chain_tgt:04X}   (verified against out/boot.bin)")
 
+    # --- the VBXE fail-fast check: ONE test, THREE binaries -------------------------
+    # The boot loader carries its own copy of detect_vbxe's $D600 FX-core test
+    # (bootloader.asm vbxe_check): it must fail ~1 s after power-on, long before
+    # awintro.xex (which holds the real detect_vbxe, src/aw_vbxe.asm) is in RAM, so
+    # the CODE cannot be shared. What can silently drift is the acceptance criteria.
+    # Read the constants out of the loader's emitted bytes and require the intro and
+    # the game to compare against the exact same values: whoever edits one copy
+    # without the other stops the build right here.
+    m1 = re.search(rb"\xAD\x40\xD6\xC9(.)", boot, re.S)          # lda $D640 / cmp #core
+    m2 = re.search(rb"\xAD\x41\xD6\x29(.)\xC9(.)", boot, re.S)   # lda $D641 / and #mask / cmp #minrev
+    if not (m1 and m2):
+        sys.exit("VBXE CHECK MISSING: out/boot.bin has no CORE_VERSION/MINOR_REVISION "
+                 "test -- bootloader.asm lost vbxe_check")
+    for name, img in (("awintro.xex", intro), ("awgame.xex", game)):
+        if m1.group(0) not in img or m2.group(0) not in img:
+            sys.exit(f"VBXE CHECK DRIFT: {name}'s detect_vbxe does not test the same "
+                     f"core/revision as the boot loader's vbxe_check.\n"
+                     f"  keep src/aw_vbxe.asm and src_game/bootloader.asm in sync")
+    # ... and ONE canonical message text. The loader prints screen codes (dta d''),
+    # the xexes ATASCII via CIO (dta c''), so derive both encodings from the one
+    # literal here and require every binary to carry it.
+    MSG = b"VBXE NOT DETECTED!"
+    scr = bytes(c - 0x20 for c in MSG)               # ATASCII $20-$5F -> screen code
+    if scr not in boot:
+        sys.exit("VBXE MESSAGE DRIFT: the boot loader does not print "
+                 "'VBXE NOT DETECTED!' (src_game/bootloader.asm vbxe_msg)")
+    for name, img in (("awintro.xex", intro), ("awgame.xex", game)):
+        if MSG not in img:
+            sys.exit(f"VBXE MESSAGE DRIFT: {name} does not carry 'VBXE NOT DETECTED!' "
+                     f"(src/aw_exit.asm nv_msg / src_game/awgame.asm nv_msg)")
+    print(f"vbxe : fail-fast check (core=${m1.group(1)[0]:02X}, "
+          f"rev&${m2.group(1)[0]:02X}>=${m2.group(2)[0]:02X}) + one message text, "
+          f"agree across boot/intro/game")
+
     disk = boot + intro + game + blob
     total_sec = len(disk) // SECTOR
     para = (total_sec * SECTOR) // 16

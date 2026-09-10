@@ -59,19 +59,6 @@ if (-not (Test-Path "out\intro_music.bin")) {
     throw "out\intro_music.bin missing - run: python tools\render_intro_audio.py (slow, one-off)"
 }
 
-# --- boot loader (3 sectors) : ALWAYS re-assembled --------------------------------
-# This used to be skipped when bootloader.asm was not NEWER than out/boot.bin, and
-# that mtime guard shipped a stale loader for weeks: the source was edited to put
-# cur_sec/buf_pos right behind the boot header (init moved $0706 -> $070D) but kept
-# an older timestamp, so the June binary (code starting at $0706) stayed on every
-# disk. intro_done then wrote cur_sec/buf_pos ON TOP OF the loader's first
-# instructions and jumped into the wreckage -> the game never came up after ESC.
-# Assembling 155 lines costs milliseconds; never trade that for a staleness bug.
-Write-Host "[boot] assembling bootloader..."
-& $mads "src_game\bootloader.asm" "-o:out\boot.xex" | Out-Null
-$b = [System.IO.File]::ReadAllBytes("out\boot.xex")
-[System.IO.File]::WriteAllBytes("out\boot.bin", $b[6..($b.Length-1)])
-
 # --- intro data (SFX tables + playlist) ------------------------------------------
 # Both regenerate from the ORIGINAL PC game data in orig/. When that folder is not
 # present, reuse the artifacts already in out/ -- but say so, and refuse to build a
@@ -119,6 +106,22 @@ $introSectors = Sectors "awintro.xex"
 $gameSec = 4 + $introSectors
 Write-Host "        intro = $introSectors sectors  ->  GAME_SEC = $gameSec"
 
+# --- boot loader (3 sectors) : ALWAYS re-assembled --------------------------------
+# This used to be skipped when bootloader.asm was not NEWER than out/boot.bin, and
+# that mtime guard shipped a stale loader for weeks: the source was edited to put
+# cur_sec/buf_pos right behind the boot header (init moved $0706 -> $070D) but kept
+# an older timestamp, so the June binary (code starting at $0706) stayed on every
+# disk. intro_done then wrote cur_sec/buf_pos ON TOP OF the loader's first
+# instructions and jumped into the wreckage -> the game never came up after ESC.
+# Assembling 155 lines costs milliseconds; never trade that for a staleness bug.
+# Sits AFTER intro pass 1 on purpose: the loader's "LOADING... nn%" counter needs
+# PCT_STEP = sectors-per-percent, which exists only once the intro is measured.
+$pctStep = [math]::Max(1, [math]::Ceiling($introSectors / 100))
+Write-Host "[boot] assembling bootloader (PCT_STEP=$pctStep)..."
+& $mads "src_game\bootloader.asm" "-d:PCT_STEP=$pctStep" "-o:out\boot.xex" | Out-Null
+$b = [System.IO.File]::ReadAllBytes("out\boot.xex")
+[System.IO.File]::WriteAllBytes("out\boot.bin", $b[6..($b.Length-1)])
+
 # --- intro pass 2 : bake the real GAME_SEC (same byte size -> layout is stable) ---
 Write-Host "[intro 4/5] assemble awintro.xex (pass 2, GAME_SEC=$gameSec)"
 & $mads "src\awvbxe.asm" "-d:GAME_SEC=$gameSec" @covoxDef "-o:awintro.xex" "-l:out\awintro.lst" | Select-Object -Last 1
@@ -144,6 +147,14 @@ if ($LASTEXITCODE -ne 0) { throw "verify_covox_detect.py FAILED - snd_detect ans
 # check where the sample actually lands.
 python "tools\verify_covox_base.py" "awintro.xex" "out\awintro.lst" | Select-Object -Last 1
 if ($LASTEXITCODE -ne 0) { throw "verify_covox_base.py FAILED - a chosen covox base does not reach the DAC" }
+
+# The menu's TEST SOUND has its own base patching (it runs before snd_go_covox may),
+# so none of the guards above cover it -- and it is the one path a user judges the
+# card by. Replay it on the real image with the real baked samples and compare the
+# DAC stream nibble by nibble, and check that the two channels this player does not
+# drive are parked at MID RAIL: on a 4-channel card they sum into the driven outputs.
+python "tools\verify_covox_preview.py" "awintro.xex" "out\awintro.lst" | Select-Object -Last 1
+if ($LASTEXITCODE -ne 0) { throw "verify_covox_preview.py FAILED - the menu test sound does not reach the DAC correctly" }
 Write-Host "        awintro.xex done ($introSectors sectors)"
 
 # --- game : 2-pass xex + part table, rebased so the blob sits AFTER the intro -----
