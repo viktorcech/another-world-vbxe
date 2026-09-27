@@ -48,12 +48,20 @@ ICAX2       equ $034B
 ; Module includes (split out of the original monolith; same order = same code).
 ; equates first (symbols used everywhere), then code at $2000, then the data.
 ;=============================================================================
+; the hot decoder / raster / text cells in zero page (6502 skill: zero page is the
+; register file), as the game does -- with the three the intro needs elsewhere moved
+; to its own free bytes (INTRO_ZP, aw_equates.inc).
+.if 1                                  ; (skill_verify_intro's old build keeps its own zp)
+GAME_ZP  = 1
+INTRO_ZP = 1
+.endif
         icl 'src/aw_equates.inc'
         icl 'src/aw_replayer.asm'
         icl 'src/aw_text.asm'
-        icl 'src/aw_exit.asm'
         icl 'src/aw_polygon.asm'
+        icl 'src/aw_exit.asm'          ; (cold: fills fill_poly_int's page pad)
         icl 'src/aw_raster.asm'
+        icl 'src/aw_raster_rare.asm' ; fill_poly_int's rare edge-step blocks (shared)
         icl 'src/aw_vbxe.asm'
         icl 'src/aw_sound.asm'         ; POKEY SFX player (op 0x08) + VRAM sfx tables
         icl 'src/aw_settings.asm'      ; pre-intro menu: POKEY / COVOX base select

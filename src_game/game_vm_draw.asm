@@ -16,24 +16,29 @@
 ;=============================================================================
 ; draw_bg (op & 0x80) : off = ((op<<8 | b()) * 2) ; x,y = b(),b() ; zoom 64 ; video1
 ;=============================================================================
+.if 1
+        nocross draw_bg, draw_bg, db_noh   ; the operand fetches and the y < 200 hop, one page
+.endif
 draw_bg
         sta vm_s2                   ; op = high byte of the offset word
 .if 1
-        mfetch                      ; low byte -> off = word * 2, shifted in A
+        mfetch0                      ; low byte -> off = word * 2, shifted in A
         asl @                       ;   (skill pass: was asl/rol in memory + copy)
         sta dr_off
         lda vm_s2
         rol @
         sta dr_off+1
-        mfetch                 ; x = b()  (0..255)
+        mfetch0                 ; x = b()  (0..255)
         sta dr_x
         sty dr_x+1                  ; = 0 (Y = 0 after mfetch)
-        mfetch                 ; y = b()
+        mfetch0                 ; y = b()
         sta dr_y
         sty dr_y+1
-        sec                         ; h = y - 199 ; if h>0 : y=199 ; x+=h  (A still = y)
+        cmp #200                    ; h = y - 199 ; if h>0 : y=199 ; x+=h  (A still = y):
+        bcc ?noh                    ;   y < 200 (the usual case) is decided here, and
+                                    ;   C = 1 feeds the sbc below
 .else
-        mfetch
+        mfetch0
         sta vm_s1                   ; low byte
         asl vm_s1                   ; off = word * 2
         rol vm_s2
@@ -41,18 +46,18 @@ draw_bg
         sta dr_off
         lda vm_s2
         sta dr_off+1
-        mfetch                 ; x = b()  (0..255)
+        mfetch0                 ; x = b()  (0..255)
         sta dr_x
         lda #0
         sta dr_x+1
-        mfetch                 ; y = b()
+        mfetch0                 ; y = b()
         sta dr_y
         lda #0
         sta dr_y+1
         lda dr_y                    ; h = y - 199 ; if h>0 : y=199 ; x+=h
         sec
 .endif
-        sbc #199
+db_c    sbc #199
         bcc ?noh
         beq ?noh
         sta vm_s1                   ; h (>0)
@@ -65,6 +70,7 @@ draw_bg
         lda dr_x+1
         adc #0
         sta dr_x+1
+db_noh
 ?noh    lda #64                     ; zoom = 64
         sta dr_zoom
 .if 1
@@ -73,6 +79,8 @@ draw_bg
         sty psp
         lda #$FF
         sta dr_col
+        ldx #<rs_fast               ; zoom 64: straight past do_draw's zoom test
+        jmp dd64
 .else
         lda #0
         sta dr_zoom+1
@@ -83,6 +91,12 @@ draw_bg
         sta psp
 .endif
         jmp do_draw
+.if 1
+        nocross4 draw_sprite, draw_sprite, ds_w0e, ds_x0, ds_ynw, ds_zb, ds_znot+1, dd_cc, dd_done
+                                    ; the w() fetch, the x + y forms through the zoomed-
+                                    ;   sprite hop to ?znot, and do_draw's cache branches:
+                                    ;   one page each
+.endif
 
 ;=============================================================================
 ; draw_sprite (op & 0x40) : the rawgl/game_sim operand decode, video1 or video2.
@@ -90,35 +104,66 @@ draw_bg
 draw_sprite
         sta vm_op                   ; save opcode
 .if 1
-        m_vm_w                    ; off = w() * 2  (A = low byte; shifted in A)
-        asl @
+.if 1
+        mfetch0x sfw20                    ; off = w() * 2  (A = low byte; shifted in A)
+sfr20
+        sta vm_s2
+        mfetch0x sfw21
+sfr21
+        sta vm_s1
+.else
+        m_vm_w0                    ; off = w() * 2  (A = low byte; shifted in A)
+.endif
+ds_w0e  asl @
         sta dr_off
         lda vm_s2
         rol @
         sta dr_off+1
-        mfetch                 ; x = b()
+.if 1
+        mfetch0x sfw22                 ; x = b()
+sfr22
+.else
+        mfetch0                 ; x = b()
+.endif
         sta dr_x
         sty dr_x+1                  ; = 0 (Y = 0 after mfetch)
         lda vm_op                   ; bits 5:4 decide the x form (one load, skill pass)
         and #$30
-        bne ?xnw
-        lda dr_x                    ; $00 : x = (x<<8) | b()  (big-endian word)
+        bne ds_xnw
+ds_x0   lda dr_x                    ; $00 : x = (x<<8) | b()  (big-endian word)
         sta dr_x+1
-        mfetch
+.if 1
+        mfetch0x sfw27
+sfr27
+.else
+        mfetch0
+.endif
         sta dr_x
         jmp ?xdone
-?xnw    cmp #$10
+.if 1
+sfw27   jsr pl_wrap
+        jmp sfr27
+.endif
+.if 1
+sfw20   jsr pl_wrap
+        jmp sfr20
+sfw21   jsr pl_wrap
+        jmp sfr21
+sfw22   jsr pl_wrap
+        jmp sfr22
+.endif
+ds_xnw  cmp #$10
         bne ?xhi
         ldx dr_x                    ; $10 : x = var[x]
 .else
-        m_vm_w                    ; off = w() * 2
+        m_vm_w0                    ; off = w() * 2
         asl vm_s1
         rol vm_s2
         lda vm_s1
         sta dr_off
         lda vm_s2
         sta dr_off+1
-        mfetch                 ; x = b()
+        mfetch0                 ; x = b()
         sta dr_x
         lda #0
         sta dr_x+1
@@ -130,7 +175,7 @@ draw_sprite
         bne ?xvar
         lda dr_x                    ; x = (x<<8) | b()  (big-endian word)
         sta dr_x+1
-        mfetch
+        mfetch0
         sta dr_x
         jmp ?xdone
 ?xvar   ldx dr_x                    ; x = var[x]
@@ -144,17 +189,27 @@ draw_sprite
 ?xhi    cmp #$30                    ; $20 : x as is ; $30 : x += 256
         bne ?xdone
         inc dr_x+1
-?xdone  mfetch                      ; y = b()  (mid-opcode -> mfetch, no bank re-own)
+?xdone  mfetch0                      ; y = b()  (mid-opcode -> mfetch, no bank re-own)
         sta dr_y
         sty dr_y+1                  ; = 0
         lda vm_op                   ; bits 3:2 decide the y form
         and #$0C
-        bne ?ynw
+        bne ds_ynw
         lda dr_y                    ; $00 : y = (y<<8) | b()
         sta dr_y+1
-        mfetch
+.if 1
+        mfetch0x sfw28
+sfr28
+.else
+        mfetch0
+.endif
         sta dr_y
         jmp ?ydone
+.if 1
+sfw28   jsr pl_wrap
+        jmp sfr28
+.endif
+ds_ynw
 ?ynw    cmp #$04
         bne ?ydone                  ; $08 / $0C : y as is
         ldx dr_y                    ; $04 : y = var[y]
@@ -163,7 +218,7 @@ draw_sprite
         and #$10
         beq ?xdone
         inc dr_x+1
-?xdone  mfetch                      ; y = b()  (mid-opcode -> mfetch, no bank re-own)
+?xdone  mfetch0                      ; y = b()  (mid-opcode -> mfetch, no bank re-own)
         sta dr_y
         lda #0
         sta dr_y+1
@@ -175,7 +230,7 @@ draw_sprite
         bne ?yvar
         lda dr_y                    ; y = (y<<8) | b()
         sta dr_y+1
-        mfetch
+        mfetch0
         sta dr_y
         jmp ?ydone
 ?yvar   ldx dr_y                    ; y = var[y]
@@ -189,12 +244,54 @@ draw_sprite
 .if 1
         sty dr_zoom+1               ; = 0 (Y = 0 after the last mfetch)
         sty poly_base_adj
-        lda vm_op                   ; bits 1:0 decide the zoom form
-        and #3
-        beq ?zdone                  ; $0 : zoom stays 64
-        cmp #1
+        lda vm_op                   ; bits 1:0 decide the zoom form: $0 (zoom stays
+        and #3                      ;   64) is the common one and falls through here;
+        bne ?znot                   ;   the other three sit out of line below
+ds_zb
+        lda #$FF
+        sta dr_col
+        sty psp                     ; = 0
+        ldx #<rs_fast               ; zoom 64: straight past do_draw's zoom test
+        jmp dd64
+ds_znot
+?znot   cmp #1                       ; the rare zoom forms, out of the common path
         bne ?z2
-        mfetch                 ; $1 : zoom = var[b()]
+.if 1
+        mfetch0x sfw26                      ; $1 : zoom = var[b()]
+sfr26
+.else
+        mfetch0                      ; $1 : zoom = var[b()]
+.endif
+        tax
+        lda var_lo,x
+        sta dr_zoom
+        lda var_hi,x
+        sta dr_zoom+1
+        jmp ?zdone
+.if 1
+sfw26   jsr pl_wrap
+        jmp sfr26
+.endif
+?z2     cmp #2
+        bne ?z3
+.if 1
+        mfetch0x sfw25                      ; $2 : zoom = b()  (mid-opcode -> mfetch)
+sfr25
+.else
+        mfetch0                      ; $2 : zoom = b()  (mid-opcode -> mfetch)
+.endif
+        sta dr_zoom
+        sty dr_zoom+1                ; = 0 (Y = 0 after mfetch)
+        jmp ?zdone
+.if 1
+sfw25   jsr pl_wrap
+        jmp sfr25
+.endif
+?z3     lda #8                       ; $3 : use video2 (shared shapes)
+        sta poly_base_adj           ; (falls into ?zdone)
+?zdone  lda #$FF
+        sta dr_col
+        sty psp                     ; = 0
 .else
         lda #0
         sta dr_zoom+1
@@ -205,34 +302,20 @@ draw_sprite
         lda vm_op
         and #1
         beq ?zdone                  ; zoom stays 64
-        mfetch                 ; zoom = var[b()]
-.endif
+        mfetch0                 ; zoom = var[b()]
         tax
         lda var_lo,x
         sta dr_zoom
         lda var_hi,x
         sta dr_zoom+1
         jmp ?zdone
-.if 1
-?z2     cmp #2
-        bne ?z3
-        mfetch                      ; $2 : zoom = b()  (mid-opcode -> mfetch)
-        sta dr_zoom
-        sty dr_zoom+1
-        jmp ?zdone
-?z3     lda #8                      ; $3 : use video2 (shared shapes)
-        sta poly_base_adj
-?zdone  lda #$FF
-        sta dr_col
-        sty psp                     ; = 0
-.else
 ?z2     lda vm_op
         and #1
         beq ?zbyte
         lda #8                      ; use video2 (shared shapes)
         sta poly_base_adj
         jmp ?zdone
-?zbyte  mfetch                      ; zoom = b()  (mid-opcode -> mfetch)
+?zbyte  mfetch0                      ; zoom = b()  (mid-opcode -> mfetch)
         sta dr_zoom
         lda #0
         sta dr_zoom+1
@@ -254,6 +337,19 @@ do_draw
         ;   zoom >= 16384       -> rs_slow  (generic fallback; never in practice)
         ; (?ddz* labels: unique on purpose -- non-.proc ?-labels mis-bind, see
         ; the find_overflow.py lesson.)
+.if 1
+        ldx #<rs_fast               ; zoom 64 (the common case) falls straight through:
+        ldy #>rs_fast               ;   the other zooms are out of line below
+        lda dr_zoom+1
+        bne ?ddzhi                  ; zoom >= 256
+        lda dr_zoom
+        cmp #64
+        bne ?ddz4                   ; zoom != 64 -> z4
+?ddzk
+dd64    stx rs_smc+1                ; (the three read_scaled paths share a page: the
+        ert [>rs_fast]<>[>rs_z4]    ;   low byte alone switches them)
+        ert [>rs_fast]<>[>rs_slow]
+.else
         ldx #<rs_fast
         ldy #>rs_fast
         lda dr_zoom+1
@@ -272,9 +368,10 @@ do_draw
         ldy #>rs_slow
 ?ddzk   stx rs_smc+1
         sty rs_smc+2
+.endif
         lda hires                   ; shape-cell cache: LR gameplay only (cells
         bne ?ddnc                   ;   are LR; SR 16008 uses the page uppers)
-        jsr cc_draw                 ; C=1 -> drawn from the cache (hit or bake)
+dd_cc   jsr cc_draw                 ; C=1 -> drawn from the cache (hit or bake)
         bcs ?dddone
 ?ddnc   ; PERF (optimisation): set_poly_ptr moved AHEAD of blit_idle (old order idled
         ;   FIRST, then synced). set_poly_ptr is pure ZP + MEMAC-B window work (NOT the
@@ -282,12 +379,48 @@ do_draw
         ;   blitter addresses via the BCB independently of the CPU window. ~50 cyc/shape
         ;   reclaimed; reads the same dr_off, so the rendered output is unchanged.
         jsr set_poly_ptr
+.if 1
+        lda cbase+2                 ; the span BCB keeps page + height between shapes:
+        cmp bcb_pg                  ;   wait + write only when one of them changed (the
+        bne ?geo                    ;   first span's own wait covers the rest -- the
+.if 1
+pbh_4   lda #0  ; SMC = poly_bcb_h;   decode now overlaps the previous shape's blit)
+.else
+        lda poly_bcb_h              ;   decode now overlaps the previous shape's blit)
+.endif
+        cmp bcb_ht
+        beq ?geok
+?geo    lda cbase+2                 ; (no wait: the blitter reads a BCB only at START)
+        sta BCB+BCB_DST_ADDR+2
+        sta bcb_pg
+.if 1
+pbh_5   lda #0  ; SMC = poly_bcb_h; 0 = 1-tall spans (full) ; 1 = 2-tall (half-res, stock)
+.else
+        lda poly_bcb_h              ; 0 = 1-tall spans (full) ; 1 = 2-tall (half-res, stock)
+.endif
+        sta BCB+BCB_HEIGHT
+        sta bcb_ht
+?geok
+.else
         jsr blit_idle               ; only NOW wait, to edit the per-shape BCB fields
         lda cbase+2
         sta BCB+BCB_DST_ADDR+2
         lda poly_bcb_h              ; 0 = 1-tall spans (full) ; 1 = 2-tall (half-res, stock)
         sta BCB+BCB_HEIGHT
+.endif
         jsr poly_draw
+dd_done
 ?dddone jmp vm_fetch                ; tail: the draw opcodes are TAIL-CALLED from
                                     ;   vm_fetch (jmp, not jsr) -> loop straight back
+.if 1
+?ddzhi  cmp #$40                    ; zoom >= 256 : < 16384 -> z4, else the generic one
+        bcs ?ddzg
+?ddz4   jsr rs_z4_set               ; patch the z4 table operands for this shape
+        ldx #<rs_z4
+        ldy #>rs_z4
+        jmp ?ddzk
+?ddzg   ldx #<rs_slow
+        ldy #>rs_slow
+        jmp ?ddzk
+.endif
 

@@ -333,16 +333,275 @@ def load_or_build_blob(force):
     return blob, table, bmp, snd_table, snd_dir, snd_pdir
 
 
+# --- ZX02 packing of the part blob (2026-09-27) ----------------------------------
+# The disk carries every resource ZX02-packed (DMSC's 6502 format, ~0.52 of raw on
+# this data vs ~0.54 DEFLATE, and a 140-byte table-free decoder). The 6502
+# (src_game/game_unpack.asm) decodes straight into the MEMAC-B window, so each
+# resource is cut into 16 KB bank chunks and every chunk is its OWN stream: a
+# back-reference never has to reach into the previous bank. A resource's streams
+# are concatenated and padded to a sector PAIR (pk_fill always reads two).
+# Sector counts in game_atr.inc stay RAW (the cell cache sizes its arenas by them
+# and they give the 6502 the number of bank chunks); only the start sectors move.
+ZX02_EXE = os.path.join(PROJ, "mads-src", "compression", "zx2", "pc", "zx02.exe")
+ZX02_CACHE = os.path.join(OUT, "zx02_cache")      # sha1(raw chunk) -> packed chunk
+PACKED_BLOB = os.path.join(OUT, "game_parts_zx.bin")   # what goes onto the disk
+BANK = 0x4000
+PK_ALIGN = 2 * SECTOR
+
+
+def zx02_decode(d, src=0):
+    """Bit-for-bit model of the 6502 decoder in src_game/game_unpack.asm (zx02-optim
+    shape, including its unchecked bit reads) -- the build fails if a stream does
+    not come back byte-exact through THIS, not through the C reference.
+    Decodes the stream at d[src:]; returns (output, where reading stopped)."""
+    out = bytearray()
+    st = {"bitr": 0x80}
+
+    def elias(x, c=None):
+        while True:
+            if c is None:                        # get_elias: asl bitr / bne
+                b = st["bitr"]
+                c, st["bitr"] = b >> 7, (b << 1) & 0xFF
+                if st["bitr"] == 0:              # sentinel shifted out: next byte
+                    nonlocal src
+                    v = d[src]; src += 1
+                    st["bitr"] = ((v << 1) | c) & 0xFF
+                    c = v >> 7
+            if not c:                            # elias_skip1: 0 ends the code
+                return x
+            b = st["bitr"]                       # elias_get: data bit, unchecked
+            st["bitr"] = (b << 1) & 0xFF
+            x = ((x << 1) | (b >> 7)) & 0xFF
+            c = None
+
+    def bit():                                   # a bare asl bitr
+        b = st["bitr"]
+        st["bitr"] = (b << 1) & 0xFF
+        return b >> 7
+
+    def copy(dist, n):
+        for _ in range(n or 256):
+            out.append(out[len(out) - dist])
+
+    off = 0                                      # offset-1, as the 6502 keeps it
+    x = elias(1)
+    while True:
+        n = x or 256                             # decode_literal
+        out += d[src:src + n]; src += n
+        if not bit():
+            copy(off + 1, elias(1))              # repeat the last offset
+            if not bit():
+                x = elias(1)
+                continue
+        while True:                              # dzx0s_new_offset
+            x = elias(1)
+            if x == 0:
+                return bytes(out), src
+            v = d[src]; src += 1
+            off = (((x - 1) & 0xFF) << 7) | (v >> 1)
+            copy(off + 1, (elias(1, v & 1) + 1) & 0xFF)
+            if bit():
+                continue
+            x = elias(1)
+            break
+
+
+def zx02_encode_greedy(data):
+    """Plain greedy ZX02 encoder (same bitstream as zx02.exe's compress.c). Only the
+    fallback for chunks zx02.exe gets WRONG: on very long runs (a 13 KB zero run in
+    a bitmap) it emits an Elias length > 256 that no decoder can read."""
+    out = bytearray()
+    st = {"mask": 0, "at": 0, "back": True}
+
+    def bit(v):
+        if st["back"]:                           # rides in bit 0 of the offset LSB
+            st["back"] = False
+            if v:
+                out[-1] |= 1
+            return
+        if not st["mask"]:
+            st["mask"], st["at"] = 0x80, len(out)
+            out.append(0)
+        if v:
+            out[st["at"]] |= st["mask"]
+        st["mask"] >>= 1
+
+    def elias(v):                                # 1..256, 256 sent as 0x100
+        i = 1
+        while i * 2 <= v:
+            i *= 2
+        while i > 1:
+            i >>= 1
+            bit(1)
+            bit(v & i)
+        bit(0)
+
+    n = len(data)
+    heads = {}
+    last, i, lit_start, prev_lit = 1, 0, 0, False
+
+    def best_match(i):
+        bl, bo = 0, 0
+        cands = [1, last] + [i - p for p in heads.get(data[i:i + 2], [])[-48:][::-1]]
+        for o in cands:
+            if o < 1 or o > i:
+                continue
+            l = 0
+            while l < 256 and i + l < n and data[i + l] == data[i + l - o]:
+                l += 1
+            if l > bl or (l == bl and o == last):
+                bl, bo = l, o
+        return bl, bo
+
+    def flush_lits(i):
+        nonlocal lit_start, prev_lit
+        if i > lit_start:
+            bit(0)
+            elias(i - lit_start)
+            out.extend(data[lit_start:i])
+            prev_lit = True
+
+    def add_head(j):
+        if j + 1 < n:
+            heads.setdefault(data[j:j + 2], []).append(j)
+
+    while i < n:
+        l, o = best_match(i)
+        lits = i - lit_start
+        rep_ok = o == last and (lits > 0 or prev_lit)
+        need = 1 if rep_ok else (2 if o <= 128 * 4 else 3)
+        if (l >= need and i > 0) or lits == 256:
+            if l < 1:
+                sys.exit("zx02 greedy: 256 literals with no match to break them")
+            flush_lits(i)
+            if o == last and prev_lit:           # repeat-offset match
+                bit(0)
+                elias(l)
+            else:
+                bit(1)
+                elias((o - 1) // 128 + 1)
+                out.append(((o - 1) % 128) << 1)
+                st["back"] = True
+                elias(l - 1 if l > 1 else 256)
+            last, prev_lit = o, False
+            for j in range(i, i + l):
+                add_head(j)
+            i += l
+            lit_start = i
+        else:
+            add_head(i)
+            i += 1
+    flush_lits(i)
+    bit(1)                                       # end marker = new offset, MSB 256
+    elias(256)
+    return bytes(out)
+
+
+def zx02_pack_all(chunks):
+    """ZX02-pack every distinct chunk once (cached by content, zx02.exe run in
+    parallel -- ~2 s per 16 KB) and verify each through zx02_decode."""
+    import hashlib, subprocess
+    from concurrent.futures import ThreadPoolExecutor
+    os.makedirs(ZX02_CACHE, exist_ok=True)
+    keys = {hashlib.sha1(c).hexdigest(): c for c in chunks}
+
+    def one(k):
+        p = os.path.join(ZX02_CACHE, k + ".zx2")
+        if not os.path.exists(p):
+            raw = os.path.join(ZX02_CACHE, k + ".bin")
+            open(raw, "wb").write(keys[k])
+            r = subprocess.run([ZX02_EXE, "-f", raw, p], capture_output=True)
+            os.remove(raw)
+            if r.returncode or not os.path.exists(p):
+                sys.exit(f"zx02 failed on chunk {k}: {r.stdout!r} {r.stderr!r}")
+        return k, open(p, "rb").read()
+
+    todo = sum(not os.path.exists(os.path.join(ZX02_CACHE, k + ".zx2")) for k in keys)
+    if todo:
+        print(f"[zx02] packing {todo} new chunk(s) of {len(keys)}...")
+    with ThreadPoolExecutor(os.cpu_count() or 4) as ex:
+        packed = dict(ex.map(one, keys))
+    def trim(k, z):
+        """-> z cut to exactly what the decoder consumes, or None if it does not
+        round-trip. The cut matters: a resource's streams sit back to back and the
+        6502 starts the next one right where this one stopped reading, but zx02.exe
+        leaves 1-4 bytes behind its end marker."""
+        try:
+            got, used = zx02_decode(z)
+        except IndexError:                       # ran off the end of the stream
+            return None
+        return z[:used] if got == keys[k] else None
+
+    nfb = 0
+    for k, z in packed.items():
+        t = trim(k, z)
+        if t is None:
+            t = trim(k, zx02_encode_greedy(keys[k]))   # zx02.exe's long-run bug
+            if t is None:
+                sys.exit(f"ZX02 VERIFY FAILED on chunk {k}: neither zx02.exe nor the "
+                         f"greedy fallback round-trips through the 6502 decoder model")
+            nfb += 1
+        packed[k] = t
+    if nfb:
+        print(f"[zx02] {nfb} chunk(s) re-encoded by the greedy fallback")
+    return {k: packed[hashlib.sha1(c).hexdigest()] for k, c in enumerate(chunks)}
+
+
+def pack_blob(blob, table, bmp, snd_table):
+    """raw blob + (rel_sector, count) entries -> packed blob + the same entries with
+    rel_sector moved into the packed blob (count stays raw)."""
+    ents = sorted({e for t in table.values() for e in t if e[1]}
+                  | {e for e in bmp.values() if e[1]}
+                  | {e for e in snd_table.values() if e[1]})
+    chunks, owner = [], []
+    for e in ents:
+        raw = blob[e[0] * SECTOR:(e[0] + e[1]) * SECTOR]
+        for o in range(0, len(raw), BANK):
+            chunks.append(raw[o:o + BANK]); owner.append(e)
+    packed = zx02_pack_all(chunks)
+    out = bytearray()
+    where = {}
+    by_content = {}                 # raw bytes -> location: identical resources are
+    skip = set()                    #   stored ONCE, and load_part relies on it (a v2
+    for i, e in enumerate(owner):   #   whose start sector matches is still resident)
+        if e not in where:
+            raw = blob[e[0] * SECTOR:(e[0] + e[1]) * SECTOR]
+            if raw in by_content:
+                where[e] = by_content[raw]
+                skip.add(e)
+                continue
+            out.extend(b"\x00" * ((-len(out)) % PK_ALIGN))
+            where[e] = by_content[raw] = (len(out) // SECTOR, e[1])
+        if e not in skip:
+            out.extend(packed[i])
+    out.extend(b"\x00" * ((-len(out)) % PK_ALIGN))
+    # the whole disk image as the 6502 reads it: every resource's streams back to back
+    for e, (sec, cnt) in where.items():
+        raw, pos = blob[e[0] * SECTOR:(e[0] + cnt) * SECTOR], sec * SECTOR
+        for o in range(0, len(raw), BANK):
+            got, pos = zx02_decode(out, pos)
+            if got != raw[o:o + BANK]:
+                sys.exit(f"ZX02 STREAM CHECK FAILED: resource at raw sector {e[0]}, "
+                         f"bank chunk {o // BANK} does not unpack from the disk image")
+    mv = lambda e: where[e] if e[1] else e
+    table = {p: tuple(mv(e) for e in t) for p, t in table.items()}
+    bmp = {n: mv(e) for n, e in bmp.items()}
+    snd_table = {p: mv(e) for p, e in snd_table.items()}
+    print(f"[zx02] part blob {len(blob)//1024} KB -> {len(out)//1024} KB on disk "
+          f"({len(out)/len(blob):.2f}), {len(chunks)} bank streams")
+    return bytes(out), table, bmp, snd_table
+
+
 def main():
     force = "--force" in sys.argv
     # --xex-start N : awgame.xex does NOT start at sector 4 -- it sits after the intro
     #   on the combined disk, so the part blob (and every sector in the emitted table)
-    #   is rebased to N + xex_sectors. --no-atr : emit ONLY the table; make_full_atr.py
+    #   is rebased to N + xex_sectors. --no-atr : emit ONLY the table; buildstep_join_disk.py
     #   assembles the actual disk. These two were passed by the build for a long time
     #   but never parsed here, so the table kept the standalone base (4 + xex_sectors)
     #   while the blob really lived after the intro -> the game streamed INTRO bytes as
     #   its bytecode and the VM ran off into the weeds. Now they are honoured, and the
-    #   resulting base is written into the .inc (GAME_BLOB_BASE) so make_full_atr.py
+    #   resulting base is written into the .inc (GAME_BLOB_BASE) so buildstep_join_disk.py
     #   can hard-verify the two agree instead of just printing a reminder.
     no_atr = "--no-atr" in sys.argv
     xex_start = 4
@@ -353,6 +612,8 @@ def main():
                  "(a standalone awgame.atr always puts the xex at sector 4)")
 
     blob, table, bmp, snd_table, snd_dir, snd_pdir = load_or_build_blob(force)
+    blob, table, bmp, snd_table = pack_blob(blob, table, bmp, snd_table)
+    open(PACKED_BLOB, "wb").write(blob)
 
     # bootable layout: boot (sectors 1-3) + awgame.xex (4..) + cached part blob
     boot = open(BOOT, "rb").read()
@@ -364,6 +625,10 @@ def main():
     xex = open(XEX, "rb").read()
     xex = xex.ljust(secs(len(xex)) * SECTOR, b"\x00")
     xex_sectors = len(xex) // SECTOR
+    if "--xex-sectors" in sys.argv:     # the disk carries awgame.xex PACKED (pack_xex.py):
+        if not no_atr:                  #   build.ps1 passes the packed file's fixed size
+            sys.exit("--xex-sectors only makes sense with --no-atr")
+        xex_sectors = int(sys.argv[sys.argv.index("--xex-sectors") + 1])
     base = xex_start + xex_sectors  # 1-based ATR sector of the blob's first sector
 
     if no_atr:
@@ -402,7 +667,7 @@ def main():
         f.write(f"; part index order: {', '.join(str(p) for p in PARTS)}\n")
         f.write(f"GAME_NPARTS = {len(PARTS)}\n")
         f.write(f"GAME_FIRST_PART = {PARTS[0]}\n")
-        # every sector below = GAME_BLOB_BASE + relative. make_full_atr.py re-derives
+        # every sector below = GAME_BLOB_BASE + relative. buildstep_join_disk.py re-derives
         # the blob's real position from the file sizes and FAILS if it disagrees with
         # this value -- the guard for the rebase bug described in main().
         f.write(f"GAME_BLOB_BASE = {base}\n\n")

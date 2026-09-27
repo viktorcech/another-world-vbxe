@@ -33,6 +33,8 @@ PCT_STEP equ 30
 
 ; === Boot entry point ===
 boot_init
+        ; (no cld here: the intro->game chain POKES $083A/$083C in this loader --
+        ;  one added byte shifts them; the cld lives in the intro's init instead)
         jsr vbxe_check          ; no VBXE/FX core -> message + halt NOW, ~1 s after
                                 ;   power-on, instead of after the whole intro load
         lda #0
@@ -205,7 +207,7 @@ rd_done lda #0
 
 ; === Variables ===
 ; src/aw_exit.asm pokes cur_sec/buf_pos from the intro through hard-coded
-; addresses (BOOT_CURSEC/BOOT_BUFPOS); tools/make_full_atr.py fails the build if
+; addresses (BOOT_CURSEC/BOOT_BUFPOS); tools/buildstep_join_disk.py fails the build if
 ; they drift. Anything added ABOVE moves them.
 rd_left     dta 0               ; read_sec retry counter
 cur_sec     dta a(4)            ; current sector number (XEX starts at 4)
@@ -223,7 +225,7 @@ pct_left    dta PCT_STEP        ; sectors left until the next percent bump; neve
 ; (FX core 1.xx) AND (MINOR_REVISION ($D641) & $70) >= $20 (v1.20+). The engine
 ; only runs at base $D600, so a card strapped to $D700 gets the same message the
 ; intro would have shown -- just minutes earlier. The copy is unavoidable (this
-; runs before one byte of any xex is in RAM); tools/make_full_atr.py compares the
+; runs before one byte of any xex is in RAM); tools/buildstep_join_disk.py compares the
 ; emitted constants against detect_vbxe's in both xex files and fails the build
 ; if the two tests ever drift apart. Placed AFTER the variables so the jsr above
 ; moves cur_sec/buf_pos by only 3 bytes.

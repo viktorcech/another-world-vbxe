@@ -13,76 +13,110 @@
 ;=============================================================================
 
 op_setpal                            ; 0x0B : nextpal = w() >> 8  (deferred)
-        m_vm_w
+.if 1
+.if 1
+        mfetch0x sfw13                     ; high byte (first) = the palette index
+sfr13
+.else
+        mfetch0                     ; high byte (first) = the palette index
+.endif
+        sta vm_pend
+        inc pl_wlo                  ; the low byte is not needed: skip it unread
+        bne ?sp0
+        jsr pl_wrap
+?sp0    jmp vm_fetch
+.if 1
+sfw13   jsr pl_wrap
+        jmp sfr13
+.endif
+.else
+        m_vm_w0
         lda vm_s2                   ; high byte = palette index
         sta vm_pend
         jmp vm_fetch
+.endif
 
-op_resettask                         ; 0x0C : reset/pause a thread range
-        mfetch
-        sta vm_s1                   ; first
-        mfetch
-        sta vm_s2                   ; last
-        mfetch
-        sta vm_op                   ; typ
-        lda vm_s2                   ; (zp reload, 3 cyc -- cheaper than tax/txa on a 6502)
-        cmp vm_s1
-        bcc ?rtdone                 ; last < first -> nothing
-        lda #1
-        sta req_any                 ; requests are pending -> next apply scan runs
-        ldx vm_s1
-?rtloop lda vm_op
-        cmp #2
-        bne ?pause
-        lda #$FE                    ; typ 2 : remove (treq = $FFFE)
-        sta treq_lo,x
-        lda #$FF
-        sta treq_hi,x
-        jmp ?rtnext
-?pause  lda vm_op                   ; else : tpause_req = typ
-        sta tpreq,x
-?rtnext cpx vm_s2
-        beq ?rtdone
-        inx
-        jmp ?rtloop
-?rtdone jmp vm_fetch
+; op_resettask moved to src_game/game_vm_resettask.asm (COLD, 0 execs/frame ->
+; out of the hot chain, into the $0DB0 region; the dispatch table reaches it).
 
 op_selpage                           ; 0x0D : cur1 = page(b()) ; draw there
-        mfetch
+.if 1
+        mfetch0x sfw6
+sfr6
+.else
+        mfetch0
+.endif
         jsr vm_page
         sta vm_cur1
         sta cur_draw
-        jsr set_cbase_cur
+        sta cbase+2                 ; set_cbase_cur inlined (callee < its 12-cycle
+        lda #0                      ;   call): A still IS cur_draw, no reload
+        sta cbase
+        sta cbase+1
         jmp vm_fetch
+.if 1
+sfw6    jsr pl_wrap
+        jmp sfr6
+.endif
 
 op_fillpage                          ; 0x0E : clear page(b()) to colour b()
-        mfetch
+.if 1
+        mfetch0x sfw11
+sfr11
+.else
+        mfetch0
+.endif
         jsr vm_page
-        pha
-        mfetch
-        tax                         ; X = colour
-        pla                         ; A = physical page
+        tax                         ; X = the physical page across one fetch
+.if 1
+        mfetch0x sfw12
+sfr12
+.else
+        mfetch0
+.endif
+        sta vm_s1                   ; colour -> X, page -> A (a zp swap: 8 cycles
+        txa                         ;   against pha/tax/pla's 9)
+        ldx vm_s1
         jsr clear_page
         jmp vm_fetch
+.if 1
+sfw11   jsr pl_wrap
+        jmp sfr11
+sfw12   jsr pl_wrap
+        jmp sfr12
+.endif
 
 op_copypage                          ; 0x0F : copy src(i) -> dst(j)
-        mfetch
+.if 1
+        mfetch0x sfw7
+sfr7
+.else
+        mfetch0
+.endif
         sta vm_s1                   ; i
-        mfetch
+.if 1
+        mfetch0x sfw8
+sfr8
+.else
+        mfetch0
+.endif
         jsr vm_page                 ; j -> physical
         sta cp_dst
         lda vm_s1
-        cmp #$FE
-        bcs ?srcFE                  ; i >= 0xFE -> page(i), plain copy
-        and #$80
-        bne ?src80                  ; 0x80 <= i < 0xFE -> page(i & 3), SCROLLED copy
-        lda vm_s1                   ; i < 0x80 -> page(i), plain copy
-        jsr vm_page
+        bmi ?hi                     ; i >= 0x80 : scrolled or 0xFE/0xFF (out of line)
+        jsr vm_page                 ; i < 0x80 -> page(i), plain copy
         sta cp_src
         jsr copy_page
         jmp vm_fetch
-?src80  lda vm_s1                   ; scrolled copy of page(i & 3) by VAR_SCROLL_Y
-        and #3
+.if 1
+sfw7    jsr pl_wrap
+        jmp sfr7
+sfw8    jsr pl_wrap
+        jmp sfr8
+.endif
+?hi     cmp #$FE
+        bcs ?srcFE                  ; i >= 0xFE -> page(i), plain copy
+        and #3                      ; 0x80 <= i < 0xFE -> page(i & 3), SCROLLED copy
         jsr vm_page
         sta cp_src
         jsr copy_page_vs
@@ -114,15 +148,14 @@ copy_page_vs
         bne ?plain                  ; |scroll| >= 256 rows -> off-screen, plain copy
         lda var_lo,x                ; hi == FF -> negative scroll (content moves up)
         beq ?plain                  ; -256 -> off-screen
-        eor #$FF
-        clc
-        adc #1                      ; mag = -scroll (1..255)
+        eor #$FF                    ; mag = -scroll (1..255): C = 1 from the cmp #$FF
+        adc #0                      ;   match, so +0+C is the +1
         cmp #SCRH
         bcs ?plain                  ; >= 200 rows visible-none -> plain
         sta cp_vs
         lda #0                      ; dir = up : offset the SRC address
         sta cp_vd
-        jmp ?blit
+        beq ?blit                   ; (A = 0: always)
 ?plain  jmp copy_page               ; (local trampoline: copy_page may be > 127B away)
 ?down   lda var_lo,x
         beq ?plain                  ; 0 -> plain copy
@@ -131,8 +164,7 @@ copy_page_vs
         sta cp_vs
         lda #1                      ; dir = down : offset the DST address
         sta cp_vd
-?blit   jsr blit_idle
-        lda #0                      ; both addresses = (0,0,page) to start
+?blit   lda #0                      ; both addresses = (0,0,page) to start
         sta BCB+BCB_SRC_ADDR
         sta BCB+BCB_SRC_ADDR+1
         sta BCB+BCB_DST_ADDR
@@ -142,19 +174,16 @@ copy_page_vs
         lda cp_dst
         sta BCB+BCB_DST_ADDR+2
         ldx cp_vs                   ; offset (lo,hi) = mag*SCRW = row_lut[mag] + ROWBIAS
-        lda row_lo,x                ; (<ROWBIAS = 0, so the low byte is unchanged)
-        ldy row_hi,x
-        pha                         ; save offset lo
-        tya
-        clc
-        adc #>ROWBIAS               ; + high byte of ROWBIAS ($40 for LR)
+        lda row_hi,x                ; (<ROWBIAS = 0, so the low byte is unchanged):
+        clc                         ;   the high byte first, into Y, then the low one
+        adc #>ROWBIAS               ;   straight into A -- no stack round-trip
         tay                         ; Y = offset hi
-        pla                         ; A = offset lo
+        lda row_lo,x                ; A = offset lo
         ldx cp_vd
         beq ?usrc                   ; dir 0 = up -> offset SRC; else down -> offset DST
         sta BCB+BCB_DST_ADDR
         sty BCB+BCB_DST_ADDR+1
-        jmp ?geom
+        bne ?geom                   ; Z = 0 (the beq ?usrc above not taken)
 ?usrc   sta BCB+BCB_SRC_ADDR
         sty BCB+BCB_SRC_ADDR+1
 ?geom   lda #<SCRW                  ; LR stride for both src & dst
@@ -181,11 +210,15 @@ copy_page_vs
         sta BCB+BCB_CTRL
         lda #$FF                    ; copy clobbered the span BCB mode fields
         sta last_scol
-        jsr fire_fill
-        rts
+        sta bcb_pg                  ; (the span BCB page / height shadow too)
+        jmp fire_fill
+        ;rts
 
+.if 1
+        nocross op_updatedisplay, ud_b, ud_c   ; the pacing resync hop (every frame)
+.endif
 op_updatedisplay                     ; 0x10 : show page, apply deferred palette, hold
-        mfetch
+        mfetch0
         cmp #$FE
         beq ?nopg
         cmp #$FF
@@ -194,7 +227,7 @@ op_updatedisplay                     ; 0x10 : show page, apply deferred palette,
         ldx vm_cur3
         sta vm_cur3
         stx vm_cur2
-        jmp ?nopg
+        bcs ?nopg                   ; (C = 1 from the cmp #$FF match: always)
 ?setc2  jsr vm_page
         sta vm_cur2
 ?nopg   jsr blit_idle               ; finish the last poly span
@@ -217,9 +250,8 @@ op_updatedisplay                     ; 0x10 : show page, apply deferred palette,
         beq ?ovr                    ; already due on ARRIVAL -> mid-frame: align
         bmi ?ovr                    ; overran -> align
 ?sp     lda pace_due
-        sec
-        sbc RTCLOK3
-        bne ?sp                     ; due ahead: spin until the observed 1 -> 0
+        cmp RTCLOK3                 ; (Z alone is read: cmp, no sec/sbc -- a tighter
+        bne ?sp                     ;   poll) due ahead: spin until the observed 1 -> 0
         beq ?due                    ;   transition = just past the tick edge
 ?ovr    jsr wait_vblank             ; late/mid-frame -> sync to vblank so the page
                                     ;   flip is tear-free and the old page is off
@@ -232,8 +264,7 @@ op_updatedisplay                     ; 0x10 : show page, apply deferred palette,
         sta vm_pend
 ?nopal  lda vm_cur2
         jsr show_page
-        ldx #$FF                    ; hold = var[0xFF] (>=1) vblanks per frame
-        lda var_lo,x
+        lda var_lo+$FF              ; hold = var[0xFF] (>=1) vblanks per frame
         bne ?h1
         lda #1
 ?h1     sta vm_hold
@@ -260,9 +291,11 @@ op_updatedisplay                     ; 0x10 : show page, apply deferred palette,
         sbc RTCLOK3                 ; if we've fallen behind (render overran), resync;
         beq ?rsy                    ;   0 headroom counts as behind too (else pace_due
         bpl ?cont                   ;   ==now locks every later frame into the overrun
+ud_b
 ?rsy    lda RTCLOK3                 ;   path -- the 0-headroom trap, see pacing.txt)
         clc
         adc vm_hold
         sta pace_due
+ud_c
 ?cont   jmp vm_fetch
 

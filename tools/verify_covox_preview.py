@@ -236,7 +236,8 @@ def main():
         for power in POWER:
             m = bytearray(mem)
             if 'body' in lab:                  # stop at the shared IRQ body
-                m[lab['body']], m[lab['body'] + 1] = 0x68, 0x60
+                m[0x06F0], m[0x06F1] = 0x68, 0x60      # (stub at $06F0, body -> jmp
+                m[lab['body']:lab['body'] + 3] = bytes([0x4C, 0xF0, 0x06])  # it: jmp/jmp())
             hw = Covox(base, power=power)
             cpu = CPU(m, hw)
             cpu.a, cpu.z, cpu.n = idx + 1, False, False

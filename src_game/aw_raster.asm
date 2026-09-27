@@ -12,6 +12,18 @@
 ;       dispatch in do_fill already proves hy stays 0..199).
 ;   Output-identical: same adds, same order, same wrap behaviour.
 ;=============================================================================
+; zero-page cells of the game raster (defined BEFORE use: a forward zp equate
+; assembles as absolute in MADS's first pass). dv_lo / dv_hi are free since the
+; inline step code keeps dx in Y.
+npair   = dv_lo                         ; the half loop's pairs left
+dsf_hh  = dv_hi                         ; draw_scanline_fast: hr's high byte
+;=============================================================================
+; two stretches in one page each (a taken branch across a page costs +1): the entry
+; test's `bcs fpi_poly` (every shape), and the half-detail loop from the tail's
+; `jeq ?row` through its odd-entry block to the last-row exit (every segment / row).
+.if 1
+        nocross2 fill_poly_int, fill_poly_int, fill_poly_int.fpi_poly+1, fill_poly_int.fpi_tail, fill_poly_int.smc_dsi+3
+.endif
 .if 1
 .proc fill_poly_int
         lda fill_col
@@ -22,31 +34,40 @@
                                     ;   below sets its own scol; text uses emit_run, see there.)
         lda nverts
         cmp #3
-        bcs ?poly
-        jmp draw_dots
+        bcc ?dots                   ; n < 3 (rare): draw_dots, out of line
 ?poly
-        ; (skill pass 2026-09-09: the indices are composed ONCE -- i=1, j=n-2 -- instead of
-        ;  i=0/j=n-1 + inc/dec afterwards; X = n-1 indexes cr straight from nverts. Same
-        ;  values, same reads.)
+fpi_poly
+.if 1
+        ldx #$D0                    ; the shape's colour mode goes into the span BCB now
+        lda scol                    ;   (no wait: the blitter reads a BCB only at START),
+        cmp #$11                    ;   so the fused spans just START: dsf_m / dsr_m =
+        bcc ?ma                     ;   bne (never taken) ...
+        ldx #$F0                    ; ... or beq for the copy mode (+ the source per span)
+        lda #$11                    ; (copy mode is keyed $11)
+?ma     stx draw_scanline_fast.dsf_m
+.ifdef HIRES_CAP
+        stx dsf_sr.dsr_m
+.endif
+        cmp last_scol
+        bne ?mset                   ; a new colour mode (out of line, above)
+?mok
+.endif
         lda #1
         sta i_idx                   ; i = 1 (the first segment is pts[0] -> pts[1])
         ldx nverts
-        stx numv
-        dex                         ; X = n-1 = j
+        txa
+        lsr @
+        sta numv                    ; n/2 : one ?seg pass per segment, +1 (n is even:
+        dex                         ;   an odd n never reached 0 -- a hang before too)
         lda #0                      ; per-polygon half-res row parity (relative to THIS poly's
-.ifdef HIRES_CAP
         sta rpar                    ;   top, not absolute hy) -> every poly draws its 1st row as
-.endif                             ;   a 2-tall span, so small polys are never dropped in half
-                                   ;   mode (was: absolute-even -> 1px rocks on odd y vanished)
-        sta cr0                     ; cr = (pts_x[j] + $8000) << 16  (X biased to
-        sta cr1                     ;   unsigned: +$8000 = +$80 in the integer hi byte,
-        sta cl0                     ;   so the edge compare/clip can be unsigned)
-        sta cl1                     ; cl = (pts_x[0] + $8000) << 16
-        lda pts_xlo,x
-        sta cr2
-        lda pts_xhi,x
-        clc
-        adc #$80
+                                    ;   a 2-tall span, so small polys are never dropped in half
+        ; cr0/cr1/cl0/cl1 are not set here: n >= 3, so the first ?seg always reaches
+        ; the per-segment reset below before any read. +$80 mod 256 = eor #$80 (C is dead).
+        lda pts_xlo,x               ; cr = (pts_x[j] + $8000) << 16  (X biased to
+        sta cr2                     ;   unsigned: +$8000 = +$80 in the integer hi byte,
+        lda pts_xhi,x               ;   so the edge compare/clip can be unsigned)
+        eor #$80
         sta cr3
         dex
         stx j_idx                   ; j = n-2
@@ -54,63 +75,267 @@
         sta hy_lo
         lda pts_yhi
         sta hy_hi
-        lda pts_xlo                 ; cl = pts_x[0] (+bias)
+        lda pts_xlo                 ; cl = (pts_x[0] + $8000) << 16
         sta cl2
         lda pts_xhi
-        clc
-        adc #$80
+        eor #$80
         sta cl3
-?seg    lda numv
-        sec
-        sbc #2
-        sta numv
+?seg    dec numv
         bne ?cont
         rts
-?cont
-        ; (skill pass 2026-09-09 -- "the value lives in A": each 16-bit difference is
-        ;  composed in the accumulator straight from the point arrays and stored ONCE.
-        ;  The old code copied pts[i] to hgt/dvr/dvl, reloaded, subtracted, stored again,
-        ;  and then copied dvr/dvl into dv for calc_step -- ~90 cyc/segment of pure
-        ;  round-trips. i >= 1 and j+1 <= n-1 always, so the -1/+1 offsets never leave
-        ;  the arrays. dvr_*/dvl_* are no longer used by the game build.)
-        ; h = pts_y[i] - pts_y[i-1]
-        ldx i_idx
+?dots   jmp draw_dots
+.if 1
+?mset   sta last_scol               ; = span_mode, inline (once a shape, out of line)
+        ldy slen_hi
+        sty BCB+BCB_WIDTH+1
+        cmp #$11
+        bcs ?mcp
+        ldy #0
+        sty BCB+BCB_AND
+        cmp #$10
+        beq ?mtr
+        sta BCB+BCB_XOR             ; solid : AND 0, XOR = colour, copy mode
+        lda #BLT_COPY
+        sta BCB+BCB_CTRL
+        jmp ?mok
+?mtr    lda #$08                    ; transparent : dest |= 8
+        sta BCB+BCB_XOR
+        lda #BLT_OR
+        sta BCB+BCB_CTRL
+        jmp ?mok
+?mcp    lda #0                      ; copy : src page 0, step 1, AND $FF, XOR 0
+        sta BCB+BCB_SRC_ADDR+2
+        sta BCB+BCB_XOR
+        lda #1
+        sta BCB+BCB_SRC_STEPX
+        lda #$FF
+        sta BCB+BCB_AND
+        lda #BLT_COPY
+        sta BCB+BCB_CTRL
+        jmp ?mok
+.endif
+?hneg   inc i_idx                   ; h < 0 : nothing drawn and the edges untouched;
+        dec j_idx                   ;   its steps / low words would be dead (every
+        jmp ?seg                    ;   drawn segment recomputes them first)
+?hzro   lda #1                      ; h == 0 : hh = 1, the steps, then the edges advance
+        sta hh                      ;   once, no draw: ?tail becomes `jmp ?hz2` for it
+        lda #$4C
+        sta ?tail
+        bne ?slopes                 ; (A = $4C: always)
+?cont   ldx i_idx                   ; h = pts_y[i] - pts_y[i-1]
         lda pts_ylo,x
         sec
         sbc pts_ylo-1,x
-        sta hgt_lo
+        tay                         ; Y = h lo
         lda pts_yhi,x
         sbc pts_yhi-1,x
-        sta hgt_hi
-        ; hh = (h>0) ? h : 1   (h >= 256 keeps the old truncation: hh = h & $FF)
-        jmi ?hh1                    ; N from the hi byte just stored (?hh1 is out of
-        ora hgt_lo                  ;   line past the row loop -> MADS Jcc pseudo-ops)
-        jeq ?hh1
-        lda hgt_lo
-        sta hh
+        bmi ?hneg
+        bne ?hpos                   ; h >= 256 : hh = row_cnt = h & $FF, as before
+        tya
+        beq ?hzro
+?hpos   sty hh
+        sty row_cnt                 ; h > 0 : draw h scanlines
 ?slopes
-        ; dv = dvr = pts_x[j] - pts_x[j+1]  -> composed DIRECTLY into calc_step's input
+        ; ---- right edge: dv = pts_x[j] - pts_x[j+1], step = dv * recip[hh] (16.16)
         ldx j_idx
         lda pts_xlo,x
         sec
         sbc pts_xlo+1,x
-        sta dv_lo
+        tay                         ; Y = dv lo
         lda pts_xhi,x
         sbc pts_xhi+1,x
-        sta dv_hi
-        ldx #0                      ; step_r -> calc_step writes the ?row smc_cr*
-        jsr calc_step               ;   operands DIRECTLY (fps wave; no N-copy)
-        ; dv = dvl = pts_x[i] - pts_x[i-1]  (calc_step touches neither pts nor i_idx)
+        sta dvsign                  ; bit 7 = the sign of dx
+        bpl ?rab
+        tya                         ; |dx| = -dv lo (|dx| < 256: the low byte is the
+        eor #$FF                    ;   whole magnitude)
+        tay
+        iny
+?rab   ldx hh                      ; X = dy
+        cpx #1
+        jeq fpi_rare.rh1
+.if 1
+        ; recip into the square operands, |dx| stays in Y: sq2[255-r+dx] ==
+        ; sq2[255-dx+r] (= (dx-r)^2/4, 16-bit equal), and the sq2 page cross
+        ; (+1, index >= 256) now needs |dx| > recip -- the rare side.
+        lda recip_lo,x
+        sta ?ra1+1
+        sta ?ra2+1
+        eor #$FF
+        sta ?ra3+1
+        sta ?ra4+1
+        lda recip_hi,x
+        sta ?rb1+1
+        sta ?rb2+1
+        eor #$FF
+        sta ?rb3+1
+        sta ?rb4+1
+?ra1  lda fmul_sq1l,y             ; p0 = |dx| * recip_lo; C=1 from cpx #1
+?ra3  sbc fmul_sq2l,y             ;   (hh >= 2 on this path), lda/sta/eor keep it
+        sta g_N0
+?ra2  lda fmul_sq1h,y
+?ra4  sbc fmul_sq2h,y
+        sta N1
+        sec
+?rb1  lda fmul_sq1l,y             ; p1 = |dx| * recip_hi
+?rb3  sbc fmul_sq2l,y
+        tax                         ; X = p1 lo
+?rb2  lda fmul_sq1h,y
+?rb4  sbc fmul_sq2h,y
+        tay                         ; Y = p1 hi
+.else
+        sty ?ra1+1                ; |dx| into both products' square operands
+        sty ?ra2+1
+        sty ?rb1+1
+        sty ?rb2+1
+        tya
+        eor #$FF
+        sta ?ra3+1
+        sta ?ra4+1
+        sta ?rb3+1
+        sta ?rb4+1
+        ldy recip_lo,x              ; p0 = |dx| * recip_lo
+        sec
+?ra1  lda fmul_sq1l,y
+?ra3  sbc fmul_sq2l,y
+        sta g_N0
+?ra2  lda fmul_sq1h,y
+?ra4  sbc fmul_sq2h,y
+        sta N1
+        ldy recip_hi,x              ; p1 = |dx| * recip_hi
+        sec
+?rb1  lda fmul_sq1l,y
+?rb3  sbc fmul_sq2l,y
+        tax                         ; X = p1 lo
+?rb2  lda fmul_sq1h,y
+?rb4  sbc fmul_sq2h,y
+        tay                         ; Y = p1 hi
+.endif
+        txa                         ; N = p0 + (p1 << 8)
+        clc
+        adc N1
+        sta N1
+        tya
+        adc #0
+        sta g_N2
+        bit dvsign
+        jmi fpi_rare.rng
+?rps  lda g_N0                    ; step and step*2 in one carry chain
+        sta fill_poly_int.smc_cr0+1
+        asl @
+        sta fill_poly_int.smc2_cr0+1
+        lda N1
+        sta fill_poly_int.smc_cr1+1
+        rol @
+        sta fill_poly_int.smc2_cr1+1
+        lda g_N2
+        sta fill_poly_int.smc_cr2+1
+        rol @
+        sta fill_poly_int.smc2_cr2+1
+        lda #0
+        sta fill_poly_int.smc_cr3+1
+        rol @
+        sta fill_poly_int.smc2_cr3+1
+st_rdn
+        ; ---- left edge: dv = pts_x[i] - pts_x[i-1], step = dv * recip[hh] (16.16)
         ldx i_idx
         lda pts_xlo,x
         sec
         sbc pts_xlo-1,x
-        sta dv_lo
+        tay                         ; Y = dv lo
         lda pts_xhi,x
         sbc pts_xhi-1,x
-        sta dv_hi
-        ldx #SMC_LD                 ; step_l -> the smc_cl* operands (same chain,
-        jsr calc_step               ;   offset by the uniform cl-cr delta)
+        sta dvsign                  ; bit 7 = the sign of dx
+        bpl ?lab
+        tya                         ; |dx| = -dv lo (|dx| < 256: the low byte is the
+        eor #$FF                    ;   whole magnitude)
+        tay
+        iny
+?lab   ldx hh                      ; X = dy
+        cpx #1
+        jeq fpi_rare.lh1
+.if 1
+        ; recip into the square operands, |dx| stays in Y: sq2[255-r+dx] ==
+        ; sq2[255-dx+r] (= (dx-r)^2/4, 16-bit equal), and the sq2 page cross
+        ; (+1, index >= 256) now needs |dx| > recip -- the rare side.
+        lda recip_lo,x
+        sta ?la1+1
+        sta ?la2+1
+        eor #$FF
+        sta ?la3+1
+        sta ?la4+1
+        lda recip_hi,x
+        sta ?lb1+1
+        sta ?lb2+1
+        eor #$FF
+        sta ?lb3+1
+        sta ?lb4+1
+?la1  lda fmul_sq1l,y             ; p0 = |dx| * recip_lo; C=1 from cpx #1
+?la3  sbc fmul_sq2l,y             ;   (hh >= 2 on this path), lda/sta/eor keep it
+        sta g_N0
+?la2  lda fmul_sq1h,y
+?la4  sbc fmul_sq2h,y
+        sta N1
+        sec
+?lb1  lda fmul_sq1l,y             ; p1 = |dx| * recip_hi
+?lb3  sbc fmul_sq2l,y
+        tax                         ; X = p1 lo
+?lb2  lda fmul_sq1h,y
+?lb4  sbc fmul_sq2h,y
+        tay                         ; Y = p1 hi
+.else
+        sty ?la1+1                ; |dx| into both products' square operands
+        sty ?la2+1
+        sty ?lb1+1
+        sty ?lb2+1
+        tya
+        eor #$FF
+        sta ?la3+1
+        sta ?la4+1
+        sta ?lb3+1
+        sta ?lb4+1
+        ldy recip_lo,x              ; p0 = |dx| * recip_lo
+        sec
+?la1  lda fmul_sq1l,y
+?la3  sbc fmul_sq2l,y
+        sta g_N0
+?la2  lda fmul_sq1h,y
+?la4  sbc fmul_sq2h,y
+        sta N1
+        ldy recip_hi,x              ; p1 = |dx| * recip_hi
+        sec
+?lb1  lda fmul_sq1l,y
+?lb3  sbc fmul_sq2l,y
+        tax                         ; X = p1 lo
+?lb2  lda fmul_sq1h,y
+?lb4  sbc fmul_sq2h,y
+        tay                         ; Y = p1 hi
+.endif
+        txa                         ; N = p0 + (p1 << 8)
+        clc
+        adc N1
+        sta N1
+        tya
+        adc #0
+        sta g_N2
+        bit dvsign
+        jmi fpi_rare.lng
+?lps  lda g_N0                    ; step and step*2 in one carry chain
+        sta fill_poly_int.smc_cl0+1
+        asl @
+        sta fill_poly_int.smc2_cl0+1
+        lda N1
+        sta fill_poly_int.smc_cl1+1
+        rol @
+        sta fill_poly_int.smc2_cl1+1
+        lda g_N2
+        sta fill_poly_int.smc_cl2+1
+        rol @
+        sta fill_poly_int.smc2_cl2+1
+        lda #0
+        sta fill_poly_int.smc_cl3+1
+        rol @
+        sta fill_poly_int.smc2_cl3+1
+st_ldn
         inc i_idx
         dec j_idx
         lda #$FF                    ; cr low word = 0x7FFF
@@ -121,87 +346,30 @@
         sta cl0
         lda #$80
         sta cl1
-        lda hgt_hi                  ; h < 0 : skip (edges untouched)
-        bmi ?segnext
-        ora hgt_lo                  ; h == 0 : advance edges once (1x), no draw
-        beq ?hzero                  ;   (h >= 256 with lo = 0 still draws: A = hi != 0)
-        lda hgt_lo
-        sta row_cnt                 ; h > 0 : draw h scanlines
-        lda poly_bcb_h              ; fps wave 2: 0 = full detail -> classic 1x
-        jne ?rowh                   ;   loop; 1 = half detail -> the PAIRED loop
-        ; --- FULL-detail row loop (poly_bcb_h = 0: Rapidus, and SR 16008). The
-        ; old per-row parity gate (lda rpar / and poly_bcb_h / bne) and the rpar
-        ; flip are GONE from this loop -- it only runs when the mask is 0, so
-        ; they were ~17 dead cycles per scanline.
-?row
-smc_dsl jsr draw_scanline           ; operand PATCHED per shape by do_fill's 3-way
-                                    ;   clip dispatch: fast (no y-test, no X-clip),
-                                    ;   yok (X-clip only) or the full draw_scanline
-        clc                         ; inline add_steps : steps are SMC immediates
-        lda cr0                     ;   (adc #imm, 2 cyc, vs adc zp 3), written by
-smc_cr0 adc #0                      ;   calc_step per segment (fps wave: directly)
-        sta cr0
-        lda cr1
-smc_cr1 adc #0
-        sta cr1
-        lda cr2
-smc_cr2 adc #0
-        sta cr2
-        lda cr3
-smc_cr3 adc #0
-        sta cr3
-        clc
-        lda cl0
-smc_cl0 adc #0
-        sta cl0
-        lda cl1
-smc_cl1 adc #0
-        sta cl1
-        lda cl2
-smc_cl2 adc #0
-        sta cl2
-        lda cl3
-smc_cl3 adc #0
-        sta cl3
-        inc hy_lo
-        bne ?hyok
-        inc hy_hi
-?hyok
-smc_yj  jmp yk_tst                  ; operand PATCHED per shape by do_fill (fps
-                                    ;   wave): bbox fully on-screen vertically ->
-                                    ;   yk_row (skip the ~11-cyc y-test per row);
-                                    ;   else yk_tst (the original bounds test)
-yk_tst  lda hy_hi
-        bmi yk_row                  ; hy < 0 (still above the top) -> keep scanning
-        bne ?retall                 ; hy >= 256 -> past the bottom, done
-        lda hy_lo
-        cmp #SCRH
-        bcs ?retall                 ; hy >= 200 -> past the bottom, done
-yk_row  dec row_cnt
-        bne ?row
-?segnext
-        jmp ?seg
-?retall rts
-        ; --- out-of-line rare cases of the segment setup (kept off the fall-through
-        ; path so the common h > 0 segment pays no jmp) ---
-?hh1    lda #1                      ; h <= 0 : hh = 1 (divisor floor)
-        sta hh
-        jmp ?slopes
-?hzero  jsr adv_edges1              ; h == 0 : advance edges once (1x), no draw
-        jmp ?seg
+?tail
+fpi_tail bit ?hz2                    ; SMC opcode: bit (h > 0) / jmp (h == 0, ?hzro)
+.if 1
+pbh_3   dta $2C                     ; SMC OPCODE (poly_bcb_h, pbh_set): $4C jmp =
+        dta a(?row)                 ;   full detail -> the classic 1x loop; $2C bit
+                                    ;   = half -> fall into PAIRED (operand fixed)
+.else
+        lda poly_bcb_h              ; 0 = full detail -> the classic 1x loop (placed
+        jeq ?row                    ;   after this one); 1 = half detail -> PAIRED
+.endif
         ; --- HALF-detail PAIRED row loop (poly_bcb_h = 1: stock 6502) ---------
         ; fps wave 2 (equivalence proof: tools/verify_halfstep.py, 8810 cases,
         ; bit-exact spans + cross-segment state): draw the parity-0 rows (2-tall
         ; spans, as before) but advance the edges ONCE per drawn row with the
-        ; DOUBLED slopes (smc2_* chain, written by calc_step) instead of stepping
+        ; DOUBLED slopes (smc2_* chain, written by the step code) instead of stepping
         ; + parity-testing every scanline -- ~half the edge-walk cost exactly in
         ; the mode that struggles (arene/jail on a 1.79 MHz 6502). rpar keeps its
         ; poly-relative, cross-segment meaning via the odd-entry/odd-exit single
         ; rows (1x steps via adv_edges1). The y-bound runs once per PAIR: hy is
         ; monotonic, so any overrun spans are y-culled inside draw_scanline (the
         ; guarded output is identical -- see the tool's divergence policy).
-?rowh   lda rpar
-        beq ?rhpair                 ; even entry -> pair loop
+?rowh
+rh_row  lda rpar
+        beq rh_ent                  ; even entry (parity 0)
         jsr adv_edges1              ; odd entry: row NOT drawn; consume 1 row,
         inc hy_lo                   ;   re-align to parity 0
         bne ?rhp1
@@ -209,16 +377,19 @@ yk_row  dec row_cnt
 ?rhp1   lda #0
         sta rpar
         dec row_cnt
-        jeq ?seg                    ; that was the segment's only row
-        lda hy_hi                   ; y-bound after the normalization row
-        bmi ?rhpair
+        bne ?rhp2
+        jmp ?seg                    ; that was the segment's only row
+?rhp2   lda hy_hi                   ; y-bound after the normalization row
+        bmi rh_ent
         bne ?retal2
         lda hy_lo
         cmp #SCRH
-        bcs ?retal2
-?rhpair lda row_cnt
-        cmp #2
-        bcc ?rhlast                 ; exactly 1 row left (parity 0)
+        bcs ?retal2                 ; past the bottom -> whole shape done
+rh_ent  lda row_cnt                 ; the rows left, as PAIRS (npair) + an odd last one
+        lsr @                       ;   (row_cnt's bit 0, read back at the end)
+        beq ?rhlast                 ; 0 or 1 row (row_cnt = 0 is one row, as before)
+        sta npair
+rh_top
 smc_dsh jsr draw_scanline           ; draw the parity-0 row (PATCHED like smc_dsl)
         clc                         ; advance BOTH rows at once: doubled steps
         lda cr0
@@ -246,30 +417,96 @@ smc2_cl2 adc #0
         lda cl3
 smc2_cl3 adc #0
         sta cl3
-        inc hy_lo                   ; hy += 2
-        bne ?rh2a
-        inc hy_hi
-?rh2a   inc hy_lo
-        bne ?rh2b
-        inc hy_hi
-?rh2b   dec row_cnt
-        dec row_cnt
-        jeq ?seg                    ; consumed the segment exactly (rpar stays 0)
-        lda hy_hi                   ; y-bound once per pair
-        bmi ?rhpair
+        lda hy_lo                   ; hy += 2, kept in A for the y-bound
+        clc
+        adc #2
+        sta hy_lo
+        bcs ?rhc                    ; (rare: hy crosses a 256 boundary)
+?rh2    dec npair
+        beq ?rhend
+        ldx hy_hi                   ; y-bound once per pair (A = hy_lo)
+        bmi rh_top
+        bne ?retal2
+        cmp #SCRH
+rh_end  bcc rh_top
+?retal2 rts                         ; past the bottom -> whole shape done
+?rhc    inc hy_hi                   ; out of line: the hy += 2 carry (C stays 1)
+        bcs ?rh2
+?rhend  lda row_cnt                 ; the pairs are done: an even count consumed the
+        lsr @                       ;   segment exactly (rpar stays 0) ...
+        bcc ?toseg
+        lda hy_hi                   ; ... an odd one: the y-bound, then the last row
+        bmi ?rhlast
         bne ?retal2
         lda hy_lo
         cmp #SCRH
-        bcc ?rhpair
-?retal2 rts                         ; past the bottom -> whole shape done
+        bcc ?rhlast
+        rts
+?toseg  jmp ?seg                    ; (?seg is out of branch range)
 ?rhlast                             ; 1 row left, parity 0: draw, advance 1x,
 smc_dsi jsr draw_scanline           ;   hand parity 1 to the next segment
         jsr adv_edges1
         inc hy_lo
-        bne ?rhl1
-        inc hy_hi
+        beq ?rhli                   ; (rare: hy crosses a 256 boundary)
 ?rhl1   lda #1
         sta rpar
+        jmp ?seg
+?rhli   inc hy_hi
+        jmp ?rhl1
+.if 1
+        nocross fr_row, fr_row, yk_row+4    ; the full-detail loop's back edge in one page
+.endif
+        ; --- FULL-detail row loop (poly_bcb_h = 0: Rapidus, and SR 16008) ---
+?row
+fr_row
+smc_dsl jsr draw_scanline           ; operand PATCHED per shape by do_fill's 3-way
+                                    ;   clip dispatch: fast (no y-test, no X-clip),
+                                    ;   yok (X-clip only) or the full draw_scanline
+        clc                         ; inline add_steps : steps are SMC immediates
+        lda cr0                     ;   (adc #imm, 2 cyc), written by the step code
+smc_cr0 adc #0
+        sta cr0
+        lda cr1
+smc_cr1 adc #0
+        sta cr1
+        lda cr2
+smc_cr2 adc #0
+        sta cr2
+        lda cr3
+smc_cr3 adc #0
+        sta cr3
+        clc
+        lda cl0
+smc_cl0 adc #0
+        sta cl0
+        lda cl1
+smc_cl1 adc #0
+        sta cl1
+        lda cl2
+smc_cl2 adc #0
+        sta cl2
+        lda cl3
+smc_cl3 adc #0
+        sta cl3
+        inc hy_lo
+        bne ?hyok
+        inc hy_hi
+?hyok
+smc_yj  jmp yk_tst                  ; operand PATCHED per shape by do_fill: bbox fully
+                                    ;   on-screen vertically -> yk_row (no y-test)
+yk_tst  lda hy_hi
+        bmi yk_row                  ; hy < 0 (still above the top) -> keep scanning
+        bne ?retall                 ; hy >= 256 -> past the bottom, done
+        lda hy_lo
+        cmp #SCRH
+        bcs ?retall                 ; hy >= 200 -> past the bottom, done
+yk_row  dec row_cnt
+        bne ?row
+        jmp ?seg
+?retall rts
+?hz2    lda #$2C                    ; h == 0 : ?tail back to `bit`, then the edges
+        sta ?tail                   ;   advance once (C still the step code's, as the
+        jsr adv_edges1              ;   old path handed adv_edges1)
         jmp ?seg
 .endp
 .else
@@ -478,7 +715,7 @@ yk_row  dec row_cnt
         ; fps wave 2 (equivalence proof: tools/verify_halfstep.py, 8810 cases,
         ; bit-exact spans + cross-segment state): draw the parity-0 rows (2-tall
         ; spans, as before) but advance the edges ONCE per drawn row with the
-        ; DOUBLED slopes (smc2_* chain, written by calc_step) instead of stepping
+        ; DOUBLED slopes (smc2_* chain, written by the step code) instead of stepping
         ; + parity-testing every scanline -- ~half the edge-walk cost exactly in
         ; the mode that struggles (arene/jail on a 1.79 MHz 6502). rpar keeps its
         ; poly-relative, cross-segment meaning via the odd-entry/odd-exit single
@@ -567,7 +804,9 @@ smc_dsi jsr draw_scanline           ;   hand parity 1 to the next segment
 ;   Relocated to the free $0F80 gap (game_text code ends ~$0B24, text data
 ;   starts $1000) -- the $2000-$3FFF chain is nearly full; `org` resumes after.
 adv_edges1_resume equ *
-        org $0F80
+.ifdef ADV_ORG
+        org ADV_ORG
+.endif
 .proc adv_edges1
         clc
         lda cr0
@@ -597,8 +836,34 @@ adv_edges1_resume equ *
         sta cl3
         rts
 .endp
+.if 1
+; pbh_set : A -> poly_bcb_h AND every SMC operand that holds it (6502 skill: a
+;   variable as the operand of lda # / adc #). Called when the detail level changes.
+pbh_set sta poly_bcb_h
+        sta pbh_4+1
+        sta pbh_5+1
+        sta cc_bake.pbh_6+1
+        sta bake_span.pbh_7+1
+        lsr @                       ; C = the mode bit (X/Y untouched: the
+        lda #$4C                    ;   set_render_mode caller keeps state there)
+        bcc ?pst                    ; 0 = full: $4C jmp = take the hop
+        lda #$2C                    ; 1 = half: $2C bit = fall through
+?pst    sta fpi_rare.pbh_1          ; the three mode HOPS are patched OPCODES;
+        sta fpi_rare.pbh_2          ;   their operands never change
+        sta fill_poly_int.pbh_3
+        lda poly_bcb_h              ; A = the mode again for the caller
+        rts
+; pf_bank_hi : bank index -> bits 14-15 of the stream offset. Read as
+;   pf_bank_hi-$80-PLAY_BANK0,x (x = the MEMAC-B bank byte): its low byte must be
+;   >= $80+PLAY_BANK0 so that base and entry share a page (no +1 per read).
+pf_bank_hi dta $00,$40,$80,$C0
+        ert [<pf_bank_hi]<[$80+PLAY_BANK0]
+        ert [<pf_bank_hi]>$FC
+.endif
+.ifdef ADV_ORG
         ert *>$0FFF                 ; stay clear of the $1000 text-data segment
         org adv_edges1_resume       ; back to the $2000 chain
+.endif
 
 ; SMC_LD : the uniform byte distance between the cr and cl step-operand chains --
 ;   calc_step targets `smc_cr*+1,x` with X = 0 (right edge) or SMC_LD (left edge).
@@ -619,6 +884,15 @@ SMC_LD  equ fill_poly_int.smc_cl0-fill_poly_int.smc_cr0
 ; draw_scanline : if hy in [0,199] emit the span [min(xl,xr),max] clipped to
 ;   [0,319], converted to page coords (LR halves x).
 .if 1
+; the common endpoint order's hop (bcs dsl_xge, taken on every span) must not
+; straddle a page: pad in front of the proc when it would.
+DSL_LEN = draw_scanline.dsl_xge+1-draw_scanline
+DSL_O   = *&$FF
+.if DSL_O+DSL_LEN>$100
+:[$100-DSL_O] dta 0
+.endif
+.endif
+.if 1
 .proc draw_scanline
         lda hy_hi                   ; (skill pass: fall-through on the in-range path,
         bne ?ret                    ;   one shared rts -- no branch-over-rts pairs)
@@ -634,56 +908,58 @@ dsl_body sta sy
         sbc cr2
         lda cl3
         sbc cr3
-        bcc ?xll
-        lda cr2                     ; xl >= xr : a=xr, b=xl
-        sta a_lo
-        lda cr3
-        sta a_hi
-        lda cl2
+        bcc ds_xb                   ; xl < xr (rare, 0/635 in the profile): out of
+                                    ;   line below, comes back to ?clip
+dsl_xge lda cl2                     ; xl >= xr : a=xr, b=xl (common: falls through)
         sta b_lo
-        lda cl3
-        sta b_hi
-        jmp ?clip
-?xll    lda cl2                     ; xl < xr : a=xl, b=xr
-        sta a_lo
-        lda cl3
-        sta a_hi
         lda cr2
-        sta b_lo
-        lda cr3
-        sta b_hi
-?clip   ; biased coords: real 0 = $8000, real 319 = $813F.  All UNSIGNED.
-        lda a_hi                    ; if a > $813F (a_real > 319) skip
-        cmp #$81
-        bcc ?aok                    ; a_hi < $81 -> a <= $80FF (or <$8000, clipped below)
-        jne ?ret                    ; a_hi > $81 -> a >= $8200 -> skip  (Jcc pseudo-ops:
-        lda a_lo                    ;   MADS emits a branch when ?ret is in range, the
-        cmp #$40                    ;   old ?bail trampoline otherwise -- never worse)
-        jcs ?ret                    ; a >= $8140 (real >= 320) -> skip
-?aok    lda b_hi                    ; if b < $8000 (b_real < 0) skip
-        cmp #$80
-        jcc ?ret
-        lda a_hi                    ; clip a to >= $8000 (a_real >= 0)
-        cmp #$80
-        bcs ?bclip
-        lda #$00
         sta a_lo
-        lda #$80
-        sta a_hi
-?bclip  lda b_hi                    ; clip b to <= $813F (b_real <= 319)
+        ldx cr3
+        stx a_hi
+        lda cl3
+        sta b_hi
+?clip   ; A = b_hi, X = a_hi through the tests (no reloads). Biased coords: real 0 =
+        ; $8000, real 319 = $813F, all UNSIGNED. An on-screen span runs every test
+        ; NOT taken; the rare clips sit out of line below and come back.
+        cpx #$81
+        bcs ?ahi                    ; a_hi >= $81 (rare): a may be past 319
+?aok    cmp #$80                    ; if b < $8000 (b_real < 0) skip
+        bcc ?ret
         cmp #$81
-        bcc ?ready                  ; b_hi < $81 -> b <= $80FF -> ok
-        bne ?bmax                   ; b_hi > $81 -> clip
-        lda b_lo
-        cmp #$40
-        bcc ?ready                  ; b <= $813F -> ok
+        bcs ?bhi                    ; b_hi >= $81 (rare): clip b to $813F
+?bok    cpx #$80
+        bcc ?alo                    ; a_hi < $80 (rare): clip a to $8000
+?ready
+dsl_rdy jmp draw_scanline_fast.es_lrf ; operand PATCHED by set_render_mode: es_lrf
+                                    ;   (LR) / dsf_sr.es_srf (SR), es_lr while baking
+?ahi    bne ?ret                    ; a_hi > $81 -> a >= $8200 -> skip
+        ldy a_lo
+        cpy #$40
+        bcc ?aok                    ; a <= $813F -> on
+?ret    rts                         ; a >= $8140 (real >= 320) -> skip
+?bhi    bne ?bmax                   ; b_hi > $81 -> clip
+        ldy b_lo
+        cpy #$40
+        bcc ?bok                    ; b <= $813F -> ok
 ?bmax   lda #$3F
         sta b_lo
         lda #$81
         sta b_hi
-?ready  jmp emit_span               ; tail-call (opt.md §1): emit_span->fill_span->fire_fill
-                                    ;   all tail-call, so ONE rts returns straight to ?row
-?ret    rts
+        bne ?bok                    ; (A = $81)
+?alo    lda #$00
+        sta a_lo
+        lda #$80
+        sta a_hi
+        bne ?ready                  ; (A = $80)
+ds_xb   lda cr2                     ; xl < xr (rare): a=xl, b=xr; ?clip needs only
+        sta b_lo                    ;   A = b_hi, X = a_hi (it sets its own flags)
+        lda cl2
+        sta a_lo
+        ldx cl3
+        stx a_hi
+        lda cr3
+        sta b_hi
+        jmp ?clip
 .endp
 .else
 .proc draw_scanline
@@ -772,18 +1048,137 @@ dsl_body sta sy
 ;   hy is then always 0..199 (no y test) and both edges stay in [0,319] (no clip):
 ;   just order the endpoints and emit.
 .if 1
+; The fused LR / SR spans: the span goes straight into the span BCB -- no sx / sy / slen
+; round-trip through zero page, no jmp cc_fsp / jmp fill_span, no per-span colour test.
+; fill_poly_int writes the shape's colour mode into the BCB up front (the blitter reads
+; a BCB only at START -- Altirra vbxe.cpp LoadBlitter / LoadBCB -- so no wait is needed
+; for the fields); each span writes its address + width, waits (hardened) and STARTs;
+; the copy mode also writes its source (dsf_m / dsr_m = beq, armed per shape).
+; Edges ordered and halved on the HALVES: x>>1 is compared on its low byte when both
+; halves share the high byte (always on this path: both edges are in [$8000,$813F]) --
+; equal halves give width 0 and the same address either way, so it is the full compare's
+; answer. The high byte test is an eor (C, the ror bit, survives it); a differing one
+; (only an edge outside 0..319: never in the game data, tools/_probe_dsf.py) takes the
+; full 16-bit compare out of line, the original code. The usual order (xl >= xr, a = hr)
+; writes the address first.
+DSF_B2  = $A5                           ; the 3rd byte (lda zp) put back by the un-patchers
+        nocross draw_scanline_fast, draw_scanline_fast.dsf_b, draw_scanline_fast.dsf_xl
 .proc draw_scanline_fast
-        ; skill pass 2026-09-09 ("the value lives in A" / no store-then-shift-in-memory):
-        ; in LR mode the span is composed STRAIGHT from the edge accumulators --
-        ; sx = min(xl,xr) >> 1 and slen = (max >> 1) - sx_lo are shifted in A and stored
-        ; once into sx/slen. The old path copied the 4 endpoint bytes to a/b, then
-        ; emit_span shifted a/b IN MEMORY (lsr/ror zp = 5 cyc each), copied a to sx and
-        ; reloaded b: ~110 cyc for what this does in ~75. Same values, same rounding
-        ; (lsr hi -> ror lo is the identical 16-bit shift). The SR (320) mode keeps the
-        ; generic a/b + emit_span path verbatim. Dispatch goes through emit_span's
-        ; cc_fsp jmp so the cell-cache's bake_span patch still catches every span.
-        lda hires
-        bne ?sr
+        ; LR, bbox fully on-screen. The first 3 bytes are patched to `jmp dsf_sr` in SR
+        ; (set_render_mode) and to `jmp dsf_bake` while the cell cache bakes.
+        ldx hy_lo                   ; X = the row (0..199 on this path)
+        lda cr3                     ; hr = xr >> 1
+        lsr @
+        sta dsf_hh
+        tay                         ; Y = hr hi
+        lda cr2
+        ror @
+        sta sx_lo
+        clc                         ; dst = row + hr
+        adc row_lo,x
+        sta BCB+BCB_DST_ADDR
+        tya
+        adc row_hi,x
+        sta BCB+BCB_DST_ADDR+1
+        lda cl3                     ; hl = xl >> 1
+        lsr @
+        eor dsf_hh                  ; the same high byte? (C = the ror bit, kept)
+        bne ?full
+        lda cl2
+        ror @
+dsf_b   sec                         ; width-1 = hl - hr
+        sbc sx_lo
+        bcc dsf_xl
+dsf_bw  sta BCB+BCB_WIDTH
+dsf_w   lda VBXE_BL_BUSY            ; hardened wait right before the START (two reads:
+        ora VBXE_BL_BUSY            ;   BUSY may read 0 for an instant between chained
+        bne dsf_w                   ;   BCBs -- a cell blit may still run)
+dsf_m   beq ?cp                     ; SMC opcode: bne (never taken) / beq (copy: Z = 1)
+        lda #1
+        sta VBXE_BL_START
+        rts
+?cp     lda BCB+BCB_DST_ADDR        ; copy from page 0 : src = the same offset, read
+        sta BCB+BCB_SRC_ADDR        ;   back from the BCB (plain VRAM through MEMAC-A:
+        lda BCB+BCB_DST_ADDR+1      ;   Altirra vbxe.cpp maps CPU reads and writes of
+        sta BCB+BCB_SRC_ADDR+1      ;   the window alike)
+        lda #1
+        sta VBXE_BL_START
+        rts
+dsf_xl  eor #$FF                    ; xl < xr : width-1 = hr - hl (C = 0 here: the +1;
+        adc #1                      ;   C = 0 after, hr - hl < 256)
+        sta BCB+BCB_WIDTH
+        lda cl3                     ; a = hl : the address again (Y = hr hi = hl hi)
+        lsr @
+        lda cl2
+        ror @
+        clc
+        adc row_lo,x
+        sta BCB+BCB_DST_ADDR
+        tya
+        adc row_hi,x
+        sta BCB+BCB_DST_ADDR+1
+        jmp dsf_w
+?full   sec                         ; the halves' high bytes differ: the full compare
+        lda cl2                     ;   of the edges (the original fast path)
+        sbc cr2
+        lda cl3
+        sbc cr3
+        bcc ?fxl
+        lda cl3                     ; xl >= xr : a = xr (the address is written)
+        lsr @
+        lda cl2
+        ror @
+        sec
+        sbc sx_lo
+        jmp dsf_bw
+?fxl    lda cl3                     ; xl < xr : a = xl, b = xr
+        lsr @
+        tay
+        lda cl2
+        ror @
+        sta sx_lo
+        clc
+        adc row_lo,x
+        sta BCB+BCB_DST_ADDR
+        tya
+        adc row_hi,x
+        sta BCB+BCB_DST_ADDR+1
+        lda cr3
+        lsr @
+        lda cr2
+        ror @
+        sec
+        sbc sx_lo
+        jmp dsf_bw
+; es_lrf : a clipped LR span from a_lo..b_hi (draw_scanline's dsl_rdy in LR, the text
+;   runs): width-1 = (b>>1) lo - (a>>1) lo as it comes, no ordering (a <= b)
+es_lrf  ldx sy
+        lda a_hi
+        lsr @
+        tay
+        lda a_lo
+        ror @
+        sta sx_lo
+        clc
+        adc row_lo,x
+        sta BCB+BCB_DST_ADDR
+        tya
+        adc row_hi,x
+        sta BCB+BCB_DST_ADDR+1
+        lda b_hi
+        lsr @
+        lda b_lo
+        ror @
+        sec
+        sbc sx_lo
+        jmp dsf_bw
+.endp
+
+.ifdef CELLCACHE
+; dsf_bake : the LR fast path through cc_fsp (bake_span) while the cell cache bakes.
+.proc dsf_bake
+        ; sx = min(xl,xr) >> 1, slen = (max >> 1) - sx_lo, shifted in A from the edge
+        ; accumulators; slen_hi stays 0 in LR. Through cc_fsp (bake_span patch).
         lda hy_lo
         sta sy                      ; (draw_scanline sets sy on its in-range path)
         sec                         ; UNSIGNED compare xl - xr (X biased) ; BCC -> xl < xr
@@ -805,9 +1200,7 @@ dsl_body sta sy
         sec
         sbc sx_lo
         sta slen_lo
-        lda #0
-        sta slen_hi
-        jmp emit_span.cc_fsp        ; -> fill_span (or bake_span while baking)
+        jmp emit_span.cc_fsp        ; -> bake_span
 ?xll    lda cl3                     ; xl < xr : a=xl, b=xr   -> sx = cl>>1
         lsr @
         sta sx_hi
@@ -821,36 +1214,91 @@ dsl_body sta sy
         sec
         sbc sx_lo
         sta slen_lo
-        lda #0
-        sta slen_hi
         jmp emit_span.cc_fsp
-?sr     lda hy_lo                   ; SR 320 (part 16008 only): the original path
-        sta sy
+.endp
+.endif
+
+.ifdef HIRES_CAP
+; dsf_sr : the fused SR 320 span (part 16008): the fast path (no clip, no y-test) and,
+;   at es_srf, the clipped one from a_lo..b_hi. offset = row2[y] + a (a $8000-biased,
+;   the LUT -$8000), width-1 = b - a (16-bit).
+        nocross dsf_sr, dsf_sr.dsr_a, dsf_sr.dsr_xl
+.proc dsf_sr
+        ldx hy_lo
         sec
         lda cl2
         sbc cr2
         lda cl3
         sbc cr3
-        bcc ?sxll
-        lda cr2                     ; xl >= xr : a=xr, b=xl
+        bcc dsr_xl
+dsr_a   lda cr2                     ; xl >= xr : a = xr, b = xl
         sta a_lo
+        clc
+        adc row_lo2,x
+        sta BCB+BCB_DST_ADDR
         lda cr3
         sta a_hi
+        adc row_hi2,x
+        sta BCB+BCB_DST_ADDR+1
         lda cl2
-        sta b_lo
+        sec
+        sbc cr2
+        sta BCB+BCB_WIDTH
         lda cl3
-        sta b_hi
-        jmp emit_span               ; tail-call, rts returns straight to ?row
-?sxll   lda cl2                     ; xl < xr : a=xl, b=xr
+        sbc cr3
+        sta BCB+BCB_WIDTH+1
+dsr_w   lda VBXE_BL_BUSY            ; hardened wait right before the START
+        ora VBXE_BL_BUSY
+        bne dsr_w
+dsr_m   beq ?cp                     ; SMC opcode: bne (never taken) / beq (copy: Z = 1)
+        lda #1
+        sta VBXE_BL_START
+        rts
+?cp     lda a_lo                    ; copy from page 0 : src = the same offset
+        clc
+        adc row_lo2,x
+        sta BCB+BCB_SRC_ADDR
+        lda a_hi
+        adc row_hi2,x
+        sta BCB+BCB_SRC_ADDR+1
+        lda #1
+        sta VBXE_BL_START
+        rts
+dsr_xl  lda cl2                     ; xl < xr : a = xl, b = xr
         sta a_lo
+        clc
+        adc row_lo2,x
+        sta BCB+BCB_DST_ADDR
         lda cl3
         sta a_hi
+        adc row_hi2,x
+        sta BCB+BCB_DST_ADDR+1
         lda cr2
-        sta b_lo
+        sec
+        sbc cl2
+        sta BCB+BCB_WIDTH
         lda cr3
-        sta b_hi
-        jmp emit_span
+        sbc cl3
+        sta BCB+BCB_WIDTH+1
+        jmp dsr_w                   ; (a jmp never pays a page cross)
+es_srf  ldx sy
+        lda a_lo
+        clc
+        adc row_lo2,x
+        sta BCB+BCB_DST_ADDR
+        lda a_hi
+        adc row_hi2,x
+        sta BCB+BCB_DST_ADDR+1
+        lda b_lo
+        sec
+        sbc a_lo
+        sta BCB+BCB_WIDTH
+        lda b_hi
+        sbc a_hi
+        sta BCB+BCB_WIDTH+1
+        jmp dsr_w
 .endp
+.endif
 .else
 .proc draw_scanline_fast
         lda hy_lo
@@ -888,14 +1336,15 @@ dsl_body sta sy
 .if 1
 .proc emit_span
 .ifdef HIRES_CAP
-        ; GAME build: pick LR (>>1, $4000-biased LUT) or SR (no shift, $8000-biased LUT)
-        ; at RUNTIME from `hires`. SR is the original .else (320) path verbatim.
+        ; GAME build: LR (>>1, $4000-biased LUT) or SR (no shift, $8000-biased LUT) from
+        ; `hires`. draw_scanline jumps straight to es_lr in LR (its dsl_rdy operand);
+        ; text comes through here. slen_hi stays 0 in LR (set_render_mode).
         lda hires
-        bne ?sr
-        lda a_hi                    ; LR : byte_a = a>>1 -- shifted IN A, stored once
-        lsr @                       ;   (skill pass: was lsr/ror on a_hi/a_lo in memory
-        sta sx_hi                   ;   + copy to sx; a/b are dead after this point --
-        lda a_lo                    ;   neither fill_span nor bake_span reads them)
+        bne es_sr
+es_lr   lda a_hi                    ; LR : byte_a = a>>1 -- shifted IN A, stored once
+        lsr @
+        sta sx_hi
+        lda a_lo
         ror @
         sta sx_lo
         lda b_hi                    ; byte_b = b>>1
@@ -905,10 +1354,9 @@ dsl_body sta sy
         sec
         sbc sx_lo
         sta slen_lo                 ; = width-1
-        lda #0
-        sta slen_hi
-        beq ?col                    ; (A = 0 -> always taken)
-?sr     lda a_lo                    ; SR : full 320-space col (a is $8000-biased)
+cc_fsp  jmp fill_span               ; operand SMC-patched: bake_span (cell-cache bake) /
+                                    ;   fill_span_sr (set_render_mode, SR)
+es_sr   lda a_lo                    ; SR : full 320-space col (a is $8000-biased)
         sta sx_lo
         lda a_hi
         sta sx_hi
@@ -919,7 +1367,7 @@ dsl_body sta sy
         lda b_hi
         sbc a_hi
         sta slen_hi
-?col
+        jmp cc_fsp
 .else
 .if LORES
         lsr a_hi                    ; byte_a = a>>1.  a is biased ($8000+) so a>>1 =
@@ -949,11 +1397,9 @@ dsl_body sta sy
         sbc a_hi
         sta slen_hi
 .endif
-.endif
-        ; PERF: scol is set ONCE per shape (fill_poly_int) / per text run (emit_run), so the
-        ;   old per-span `lda poly_color / sta scol` here is gone (~5 cyc/span saved).
 cc_fsp  jmp fill_span               ; operand SMC-patched -> bake_span by the GAME's
-.endp                               ;   cell-cache during a bake (intro never patches)
+.endif                              ;   cell-cache during a bake (intro never patches)
+.endp
 .else
 .proc emit_span
 .ifdef HIRES_CAP
@@ -1025,18 +1471,20 @@ cc_fsp  jmp fill_span               ; operand SMC-patched -> bake_span by the GA
 .endif
 
 ; draw_dots : degenerate polygon (n<3) -> plot each vertex as a 1-px span.
+        nocross draw_dots, draw_dots.dd_l, draw_dots.dd_nx
 .proc draw_dots
         lda #0
         sta vidx
-?l      ldx vidx
+?l
+dd_l    ldx vidx
         lda pts_yhi,x
-        bne ?nx
+        bne dd_nx
         lda pts_ylo,x
         cmp #SCRH
-        bcs ?nx
+        bcs dd_nx
         sta sy
         lda pts_xhi,x
-        bne ?nx
+        bne dd_nx
         lda pts_xlo,x               ; x < 256 here, so always within 320-space
 .ifdef HIRES_CAP
         ldy hires
@@ -1064,6 +1512,7 @@ cc_fsp  jmp fill_span               ; operand SMC-patched -> bake_span by the GA
         lda poly_color
         sta scol
 cc_dds  jsr fill_span               ; operand SMC-patched -> bake_span (see emit_span)
+dd_nx
 ?nx     inc vidx
         lda vidx
         cmp nverts

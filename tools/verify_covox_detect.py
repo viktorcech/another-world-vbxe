@@ -287,6 +287,7 @@ class CPU:
             elif op == 0x20: self.stack.append(pc + 3); pc = ab
             elif op == 0x60: pc = self.stack.pop()
             elif op == 0x4C: pc = ab
+            elif op == 0x6C: pc = self.m[ab] | (self.m[(ab & 0xFF00) | ((ab + 1) & 0xFF)] << 8)
             elif op == 0xD0: pc = rel if not self.z else pc + 2
             elif op == 0xF0: pc = rel if self.z else pc + 2
             elif op == 0x30: pc = rel if self.n else pc + 2

@@ -28,8 +28,16 @@
 .macro m_vm_w
         mfetch
         sta vm_s2                   ; high byte first (big-endian)
-        mfetch
+        mfetch0
         sta vm_s1                   ; low byte (A = low on exit)
+.endm
+
+; m_vm_w0 : m_vm_w with Y already 0 (the VM handler invariant, see mfetch0)
+.macro m_vm_w0
+        mfetch0
+        sta vm_s2
+        mfetch0
+        sta vm_s1
 .endm
 
 ; vm_w : the jsr-able form, kept for the COLD caller (game_text.asm op_drawstring);
@@ -37,18 +45,52 @@
 vm_w    m_vm_w
         rts
 
+; pl_wrap : handle the rare pointer wrap (256-byte page / 16K bank). Preserves A.
+.proc pl_wrap
+        inc pl_whi                  ; $40..$7F: $80 (N = 1) = past $7FFF -> next bank
+        bmi ?nb
+        rts
+?nb     pha
+        lda #>DATAW
+        sta pl_whi
+        inc pl_bank
+        lda pl_bank
+        sta memb_cur
+        sta VBXE_MEMAC_B
+        pla
+        rts
+.endp
+
 ; vm_setpc : seek the bytecode pointer to the 16-bit PC in vm_s2:vm_s1.
 ;   pl_addr = PLAY_BASE + pc ; bytecode < 64 KB so pl_hi is constant.
+.if 1
+.else
 vm_setpc
         lda vm_s1
         sta pl_lo
         lda vm_s2
         sta pl_mid
         jmp set_pl_ptr              ; sync pointer + bank, then return to caller
+.endif
+
+; (vm_goto sits in game_vm_sched.asm, between vm_run_thread and vm_fetch: both fall
+;  into it / out of it with no jmp)
 
 ; vm_save_pc : derive the logical PC (pl_lo/pl_mid) from the running window pointer
 ;   (pl_bank/pl_whi/pl_wlo), for saving on yield/remove/call (aw3 drops the per-byte
 ;   PC). Inverse of set_pl_ptr; uses tmp_lo so vm_s1/vm_s2 (a call target) survive.
+.if 1
+; (inline in its two callers, op_call and vm_exit: the m_save_pc macro)
+.macro m_save_pc
+        lda pl_wlo
+        sta pl_lo
+        ldx pl_bank                 ; $80 | bank: the LUT base is offset by it instead
+        lda pl_whi                  ;   of and #$7F / sec / sbc / tax
+        and #$3F
+        ora pf_bank_hi-$80-PLAY_BANK0,x   ; | bank_idx<<6
+        sta pl_mid                  ; (A = pl_mid on exit)
+.endm
+.else
 vm_save_pc
         lda pl_wlo
         sta pl_lo
@@ -62,6 +104,7 @@ vm_save_pc
         ora pf_bank_hi,x            ; | bank_idx<<6 (LUT, was a 6x asl chain)
         sta pl_mid
         rts
+.endif
 
 ;=============================================================================
 ; vm_page : resolve a page argument in A -> physical page index in A.

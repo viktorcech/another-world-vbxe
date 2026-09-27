@@ -192,9 +192,10 @@ snd_init
         sta AUDC4                    ;   start silent
         lda #15
         sta AUDF1                    ; ~3995 Hz
-        lda #0
-        sta snd_active
-        sta zmus_st
+        lda #<snd_irq.moff           ; both voices off (the states are the IRQ's
+        sta snd_irq.body+1           ;   jump operands)
+        lda #<snd_irq.soff
+        sta snd_irq.sfxj+1
 .ifdef COVOX_FORCE
         lda snd_mode                 ; TEST BUILD (build.ps1 -ForceCovox): skip the
         bmi ?d280                    ;   probe and go 8-bit unconditionally. POKEY is
@@ -622,7 +623,7 @@ CVTAIL_LEN = cv_tail_end-cv_tail
         lda cv_next
 cvw0    sta COVOXL                   ; SMC oper : base+0 / base+1 of whichever
 cvw1    sta COVOXR                   ;   card the menu picked (cv_set_base)
-        jmp snd_irq.body
+        jmp (snd_irq.body+1)         ; straight to the music state (5 vs jmp + jmp 6)
 .endp
 
 ;-----------------------------------------------------------------------------
@@ -676,7 +677,7 @@ snd_play
         and #$3C                       ; voltab row = vol>>2 ; row byte offset =
         asl @                          ;   (vol>>2)*16 = (vol&$3C)<<2
         asl @
-        clc
+        ;clc
 vb1     adc #<voltab                   ; SMC imm : voltab / voltab8 (covox mode
         sta ?vs+1                      ;   swaps the curve set, see cvpatch)
 vb2     lda #>voltab
@@ -703,8 +704,8 @@ vb2     lda #>voltab
         sbc sfx_lenhi,x
         sta snd_rem+1
         sei
-        lda #1
-        sta snd_active                 ; state 1 = phase 0 next
+        lda #<snd_irq.sp0
+        sta snd_irq.sfxj+1             ; phase 0 next
         lda POKMSK
         ora #$01
         sta POKMSK
@@ -726,7 +727,6 @@ mus_play
         sta zmus_bank
         lda #0
         sta mus_bidx
-        sta mus_hold                   ; first tick processes (the toggle flips to 1)
         lda #<MUS_NEG                  ; mus_rem = -MUSIC_LEN (24-bit, counts UP)
         sta mus_rem
         lda #[[MUS_NEG>>8]&$FF]
@@ -734,8 +734,8 @@ mus_play
         lda #[[MUS_NEG>>16]&$FF]
         sta mus_rem+2
         sei
-        lda #1
-        sta zmus_st                    ; state 1 = phase 0 next
+        lda #<snd_irq.mp0
+        sta snd_irq.body+1             ; the first tick processes phase 0
         lda POKMSK
         ora #$01
         sta POKMSK
@@ -751,6 +751,7 @@ mus_play
 ;   through ?tail, which restores MEMAC-B to memb_cur (a redundant write when
 ;   nothing was read -- cheaper than tracking it).
 ;-----------------------------------------------------------------------------
+        nocross snd_irq, snd_irq.sfxj, snd_irq.soff   ; the SFX states' page
 .proc snd_irq
         pha
         lda IRQEN                    ; bit0 = 0 -> Timer 1 pending (ours)
@@ -761,79 +762,17 @@ mus_play
 ?ours   lda POKMSK                   ; acknowledge + re-arm Timer 1
         and #$FE
         sta IRQEN
-        lda POKMSK
-        sta IRQEN
-
-        ; ---- voice 1 : MUSIC on AUDC2 ----
-body    lda zmus_st                  ; cv_irq jumps in here (shared from now on)
-        bne ?m_go
-        lda snd_active               ; music off:
-        beq ?off2                    ;   both off -> stray after stop -> disable
-        jmp ?s_go                    ;   SFX-only tick
-?off2   jmp ?off
-?m_go   lda mus_hold                 ; half-rate: advance the voice every OTHER
-        eor #1                       ;   tick; on the hold tick AUDC2 keeps the
-        sta mus_hold                 ;   current nibble
-        beq ?sfx
-        lda zmus_st
-        cmp #2
-        beq ?m_lo
-        ; --- state 1 / phase 0 : read the VRAM byte, output the HI nibble ---
-        lda zmus_bank
-        sta VBXE_MEMAC_B
-mus_rd  lda $4000                    ; operand = byte ptr (mus_play / ?madv patch it)
-        sta mus_cur                  ; lo nibble parked for phase 1
-        lsr @
-        lsr @
-        lsr @
-        lsr @
-mo0     ora #$10                     ; 5-byte SMC slot (see cv_mo): POKEY writes
-        sta AUDC2                    ;   the volume-only nibble to AUDC2, covox
-                                     ;   parks it for the mix tail
-        lda #2
-        sta zmus_st                  ; state 2 = phase 1 next
-        bne ?sfx                     ; always
-?m_lo   ; --- state 2 / phase 1 : output the LO nibble, count, advance ---
-        lda mus_cur
-        and #$0F
-mo1     ora #$10                     ; same 5-byte slot as mo0
-        sta AUDC2
-        lda #1
-        sta zmus_st                  ; state 1 = phase 0 next
-        inc mus_rem                  ; rem++ toward $000000 (stored negated, 24-bit)
-        bne ?madv                    ; common case: 9 cyc total
-        inc mus_rem+1
-        bne ?madv
-        inc mus_rem+2
-        bne ?madv
-        lda #0                       ; stream done -> music off; the timer stays
-        sta zmus_st                  ;   if an SFX is still running (checked below)
-ms0     lda #$00                     ; SMC imm  : $00 POKEY / $08 covox nibble
-ms1     sta AUDC2                    ; SMC oper : AUDC2 / mus_out
-        lda snd_active
-        bne ?sfx
-        jmp ?off                     ; nothing left -> disable the timer
-?madv   inc mus_rd+1                 ; advance the read operand to the next byte
-        bne ?sfx
-        inc mus_rd+2
-        lda mus_rd+2
-        cmp #$80                     ; crossed the 16 KB window -> next bank from
-        bne ?sfx                     ;   the LIST (the gap banks are NOT contiguous)
-        lda #$40
-        sta mus_rd+2
-        stx mus_savx                 ; rare (every 16 KB ~ 16 s): X via memory
-        inc mus_bidx
-        ldx mus_bidx
-        lda mus_banks,x
-        sta zmus_bank
-        ldx mus_savx
-
-        ; ---- voice 2 : SFX on AUDC4 ----
-?sfx    lda snd_active
-        beq ?tail                    ; no SFX; music runs -> the timer stays armed
-?s_go   cmp #2
-        beq ?s_lo
-        ; --- state 1 / phase 0 : read the VRAM byte, output the HI nibble ---
+        lda POKMSK                   ; (reloaded, not `ora #$01`: a stray tick after
+        sta IRQEN                    ;   ?off must re-arm nothing)
+        ; Each voice's state IS the low byte of its own `jmp` (6502 skill: patch an
+        ; operand to switch behaviour) -- no state cells to load, test and dispatch:
+        ;   music : mp0 -> mh2 -> mp1 -> mh1 -> mp0 ... (half rate: a hold tick keeps
+        ;           AUDC2's nibble between the phases) ; moff
+        ;   SFX   : sp0 -> sp1 -> sp0 ... ; soff
+        ; Each state set sits in one page (only the low byte is ever written).
+body    jmp moff                     ; voice 1, MUSIC on AUDC2 (cv_irq: jmp (body+1))
+sfxj    jmp soff                     ; voice 2, SFX on AUDC4
+sp0     ; --- SFX phase 0 : read the VRAM byte, output the HI nibble ---
         lda zsnd_bank
         sta VBXE_MEMAC_B
 snd_rd  lda $4000                    ; operand = byte ptr (snd_play / phase 1 patch it)
@@ -847,28 +786,29 @@ snd_rd  lda $4000                    ; operand = byte ptr (snd_play / phase 1 pa
 so0     sta AUDC4                    ; SMC oper : AUDC4 / sfx_out. POKEY curve
                                      ;   entries are pre-ORed with $10; the
                                      ;   covox ones are linear 0..127 (voltab8)
-        lda #2
-        sta snd_active               ; state 2 = phase 1 next
-        bne ?tail                    ; always
-?s_lo   ; --- state 2 / phase 1 : output the LO nibble, count, advance ---
+        lda #<sp1
+        sta sfxj+1
+        bne ?tail                    ; (A != 0: always)
+sp1     ; --- SFX phase 1 : output the LO nibble, count, advance ---
         lda zsnd_cur
         and #$0F
         sta ?vl+1                    ; volume curve, as in phase 0
 ?vl     lda snd_vt
 so1     sta AUDC4                    ; SMC oper : AUDC4 / sfx_out (as so0)
-        lda #1
-        sta snd_active               ; state 1 = phase 0 next
+        lda #<sp0
+        sta sfxj+1
         inc snd_rem                  ; rem++ toward $0000 (stored negated)
         bne ?adv                     ; common case: 9 cyc total
         inc snd_rem+1
         bne ?adv
-        lda #0                       ; sample done -> SFX off; keep the timer if
-        sta snd_active               ;   the music is still streaming
+        lda #<soff                   ; sample done -> SFX off; keep the timer if
+        sta sfxj+1                   ;   the music is still streaming
 ss0     lda #$00                     ; SMC imm  : $00 POKEY / $40 covox level
 ss1     sta AUDC4                    ; SMC oper : AUDC4 / sfx_out
-        lda zmus_st
+        lda body+1
+        cmp #<moff
         bne ?tail
-        jmp ?off                     ; nothing left -> disable the timer
+        beq ?off                     ; nothing left -> disable the timer (Z = 1)
 ?adv    inc snd_rd+1                 ; advance the read operand to the next byte
         bne ?tail
         inc snd_rd+2
@@ -883,6 +823,7 @@ ss1     sta AUDC4                    ; SMC oper : AUDC4 / sfx_out
         lda sfx_blist,x
         sta zsnd_bank
         ldx mus_savx
+soff                                 ; SFX off (the music runs): straight to the tail
 ?tail
 cvtail  lda memb_cur                 ; restore the poly/playlist bank (a no-op
         sta VBXE_MEMAC_B             ;   write when nothing was read this tick)
@@ -903,6 +844,75 @@ cvtail_end
         sta IRQEN
         pla
         rti
+        nocross mh1, mh1, moff       ; the music states' page (the pad is past an rti)
+mh1     lda #<mp0                    ; MUSIC hold tick (AUDC2 keeps its nibble); phase 0
+        sta body+1                   ;   next
+        jmp sfxj
+mh2     lda #<mp1                    ; MUSIC hold tick; phase 1 next
+        sta body+1
+        jmp sfxj
+mp0     ; --- MUSIC phase 0 : read the VRAM byte, output the HI nibble ---
+        lda zmus_bank
+        sta VBXE_MEMAC_B
+mus_rd  lda $4000                    ; operand = byte ptr (mus_play / ?madv patch it)
+        sta mus_cur                  ; lo nibble parked for phase 1
+        lsr @
+        lsr @
+        lsr @
+        lsr @
+mo0     ora #$10                     ; 5-byte SMC slot (see cv_mo): POKEY writes
+        sta AUDC2                    ;   the volume-only nibble to AUDC2, covox
+                                     ;   parks it for the mix tail
+        lda #<mh2
+        sta body+1
+        jmp sfxj
+mp1     ; --- MUSIC phase 1 : output the LO nibble, count, advance ---
+        lda mus_cur
+        and #$0F
+mo1     ora #$10                     ; same 5-byte slot as mo0
+        sta AUDC2
+        lda #<mh1
+        sta body+1
+        inc mus_rem                  ; rem++ toward $000000 (stored negated, 24-bit)
+        bne ?madv                    ; common case: 9 cyc total
+        inc mus_rem+1
+        bne ?madv
+        inc mus_rem+2
+        bne ?madv
+        lda #<moff                   ; stream done -> music off; the timer stays
+        sta body+1                   ;   if an SFX is still running
+ms0     lda #$00                     ; SMC imm  : $00 POKEY / $08 covox nibble
+ms1     sta AUDC2                    ; SMC oper : AUDC2 / mus_out
+        jmp moff
+?madv   inc mus_rd+1                 ; advance the read operand to the next byte
+        beq ?mpg
+        jmp sfxj
+?mpg    inc mus_rd+2
+        lda mus_rd+2
+        cmp #$80                     ; crossed the 16 KB window -> next bank from
+        beq ?mbk                     ;   the LIST (the gap banks are NOT contiguous)
+        jmp sfxj
+?mbk    lda #$40
+        sta mus_rd+2
+        stx mus_savx                 ; rare (every 16 KB ~ 16 s): X via memory
+        inc mus_bidx
+        ldx mus_bidx
+        lda mus_banks,x
+        sta zmus_bank
+        ldx mus_savx
+        jmp sfxj
+moff    lda sfxj+1                   ; music off: an SFX-only tick, or -- both off --
+        cmp #<soff                   ;   a stray after the stop -> disable
+        beq ?mo2
+        jmp sfxj
+?mo2    jmp ?off
+        ert [>moff]<>[>mh1]          ; each state jump only ever gets its LOW byte
+        ert [>moff]<>[>mh2]          ;   written: its targets share one page
+        ert [>moff]<>[>mp0]
+        ert [>moff]<>[>mp1]
+        ert [>soff]<>[>sp0]
+        ert [>soff]<>[>sp1]
+        ert [<[body+1]]=$FF          ; (jmp (body+1) must not straddle a page)
 .endp
 
 ;-----------------------------------------------------------------------------
@@ -914,3 +924,198 @@ cvtail_end
                                               ;   aw_data.asm, where the org is a window
                                               ;   address and a table would land ON the
                                               ;   samples it describes.
+
+; (moved here from aw_settings.asm: the preview runs with the MEMAC-B window ON,
+;  so it and everything it reads must sit below $4000 -- the menu UI need not)
+;-----------------------------------------------------------------------------
+; snd_preview : play ONE random GAME sound through the CURRENTLY SELECTED output.
+;
+;   This is the only honest test for the three PBI bases -- they cannot be probed
+;   (see the header), so the answer is "press OPTION and listen". The sounds are
+;   real game SFX, baked into this build by tools/gen_test_sfx.py because the
+;   menu runs long before any game data is on the machine; they sit in the dead
+;   tail of the last music VRAM bank. A beep would only prove that a wire is
+;   connected -- this walks a real sample stream, through the same volume curve,
+;   around the same mix centre as the IRQ does in the game. The pacing is a delay
+;   loop instead of Timer 1, because at menu time the IRQ is not hooked yet and
+;   snd_go_covox -- a ONE-WAY switch -- must not happen until the user has
+;   actually chosen.
+;
+;   $D280 with the probe saying NONE is deliberately SILENT. There, base+1 is
+;   AUDC1 on a stock POKEY and the linear covox curve (n*8 + 64) has volume bits
+;   set in half its entries, so playing it would make POKEY noise and the user
+;   would "hear a covox" that three probes just proved is not there. The other
+;   three bases need no such care: nothing else in the machine answers them.
+;
+;   ~444 cycles per nibble = the ~3995 Hz the samples were baked at. Each sound
+;   is under half a second by construction, and the window-end check is a belt-
+;   and-braces stop: nothing here walks a bank list the way the IRQ does.
+;
+;   The covox path parks base+2/base+3 at mid rail first. This is the ONLY place
+;   that has to do it itself: on a 4-channel card those two channels sum into the
+;   same two outputs the driven pair feeds, and at menu time nothing in the
+;   machine has ever written them -- on real hardware they hold whatever the
+;   latches powered up with. snd_go_covox does the same, but only at snd_init,
+;   which is after START.
+;-----------------------------------------------------------------------------
+; Delay iterations. The two halves of the inner loop are NOT symmetric: after
+; the LOW nibble the loop also does inc ?rd+1 / inc ?nl / jmp / the window-end
+; check / the byte fetch and unpack -- 39 cycles the HIGH nibble's half does not
+; pay. With one constant for both the sample clock alternated 426 / 465 cycles,
+; an 8.8% square-wave modulation at exactly Fs/2 = 2009 Hz: a whistling tone laid
+; over every test sound, on POKEY and covox alike (they share ?snd). Measured on
+; the assembled bytes, the two halves are
+;     A = 5*PRV_DH + 31      (hi -> lo nibble)
+;     B = 5*PRV_DL + 70      (lo -> hi nibble)
+; so PRV_DL has to run 8 iterations short. 83/75 gives 446 / 445 -- one cycle
+; apart, and the mean period stays 445.5 cycles = the ~4 kHz the samples were
+; baked at. The IRQ-driven players do not need this: Timer 1 is exact by
+; construction, which is why only the menu's test tone ever whistled.
+PRV_DH  = 83                         ; hi -> lo nibble
+PRV_DL  = 75                         ; lo -> hi nibble: 39 cycles of loop tail
+
+        nocross2 snd_preview, snd_preview.prv_lp, snd_preview.prv_end, prv_vt, prv_vt+16
+                                    ; the timed loop (5-cycle delay steps: no branch
+                                    ;   may cross a page) and the level table
+.proc snd_preview
+        lda #0
+        sta AUDCTL
+        sta AUDC1
+        sta AUDC2
+        sta AUDC3
+        sta AUDC4
+        lda #3
+        sta SKCTL                    ; RANDOM below needs the polys running
+        ; --- where does it go, and is it worth writing there at all? ---
+        ldx set_sel
+        beq ?pokey
+        cpx #1
+        bne ?cv                      ; $D500/$D600/$D700: nothing else answers
+        lda pm_seen                  ; $D280: only when the probe found a card --
+        bne ?cv                      ;   see the header
+        rts                          ;   NONE: stay silent rather than answer with
+                                     ;   POKEY noise the user would misread
+?cv     dex                          ; 1..4 -> covox base index 0..3
+        lda cv_bhi,x                 ; the page is the same for all four ports
+        sta ?o1+2
+        sta ?o2+2
+        lda cv_blo,x                 ; --- the pair this player does NOT drive:
+        clc                          ;     park it at MID RAIL, once, before the
+        adc #2                       ;     first sample. On a 4-channel card the
+        sta ?o1+1                    ;     pairs SUM into one output each, so a
+        adc #1                       ;     channel still holding its power-on
+        sta ?o2+1                    ;     value drags the analogue sum off
+        lda #$80                     ;     centre and can clip the whole test
+        jsr ?snd                     ;     tone. snd_go_covox parks them too, but
+                                     ;     that runs at snd_init -- AFTER this
+                                     ;     menu, so the test sound is the one
+                                     ;     place nothing has ever written them.
+        lda cv_blo,x                 ; --- and now the driven pair
+        sta ?o1+1
+        clc
+        adc #1                       ; base+0 = left, base+1 = right
+        sta ?o2+1
+        ldy #15                      ; the LINEAR curve at full volume, lifted by
+?cl     lda voltab8+15*16,y          ;   the 64 the mix tail adds for a silent
+        clc                          ;   music voice -- so the DAC swings around
+        adc #64                      ;   $80 exactly as it does in the intro
+        sta prv_vt,y
+        dey
+        bpl ?cl
+        jmp ?dup                     ; skill-ok JMPFLAG: a bmi here crosses a page (+1)
+?pokey  lda #<AUDC4                  ; the SFX voice, volume-only like the player
+        sta ?o1+1
+        sta ?o2+1
+        lda #>AUDC4
+        sta ?o1+2
+        sta ?o2+2
+        ldy #15
+?pl     lda voltab+15*16,y           ; already $10-ORed for AUDC volume-only
+        sta prv_vt,y
+        dey
+        bpl ?pl
+?dup    ; --- pick one of the baked GAME sounds (tools/gen_test_sfx.py) --------
+        lda RANDOM
+        and #$0F                     ; 0..15
+        cmp #TST_COUNT
+        bcc ?rok
+        sbc #TST_COUNT               ; fold the rest down. NOT a re-roll loop: a
+?rok    tax                          ;   frozen RANDOM ($FF) would spin forever
+        lda #TST_BANK
+        sta VBXE_MEMAC_B             ; window $4000 -> the bank they were baked in
+        lda tst_winlo,x              ;   (one bank for all of them: no walk)
+        sta ?rd+1
+        lda tst_winhi,x
+        sta ?rd+2
+        sec                          ; count = -len : the loop counts UP to $0000
+        lda #0
+        sbc tst_lenlo,x
+        sta ?nl
+        lda #0
+        sbc tst_lenhi,x
+        sta ?nh
+        sei                          ; the OS VBI would warble the sample clock --
+        lda #0                       ;   and SEI does not mask NMI, so the VBI has
+        sta NMIEN                    ;   to go too: ~1000 cycles stolen 50x a second
+                                     ;   is an audible tick on a 4 kHz stream. Safe
+                                     ;   for the ~0.45 s this runs: ANTIC playfield
+                                     ;   DMA is already off (SDMCTL = 0), the display
+                                     ;   is XDL-driven, read_console polls CONSOL
+                                     ;   itself, and nothing here needs RTCLOK. The
+                                     ;   real covox players do the same (examples/
+                                     ;   players/inertia_player_4.5: jsr os_off).
+prv_lp
+?loop   lda ?rd+2
+        cmp #$80
+        bcs ?end                     ; ran into the next bank: stop, no walk
+?rd     lda $FFFF                    ; SMC : the sample byte -- 2 nibbles, hi first
+        tax
+        lsr @
+        lsr @
+        lsr @
+        lsr @
+        tay
+        lda prv_vt,y
+        jsr ?snd
+        ldy #PRV_DH
+?dh     dey
+        bne ?dh
+        txa
+        and #$0F
+        tay
+        lda prv_vt,y
+        jsr ?snd
+        inc ?rd+1
+        bne ?ct
+        inc ?rd+2
+?ct     inc ?nl
+        bne ?more
+        inc ?nh
+        beq ?end
+?more   ldy #PRV_DL                  ; 8 short: this half carries the loop tail
+?dl     dey
+        bne ?dl
+        beq ?loop                    ; (Z = 1: the bne above not taken)
+prv_end
+?end    lda #$80                     ; park: covox mid rail ...
+        ldx set_sel
+        bne ?pk
+        lda #0                       ;   ... or POKEY volume off
+?pk     jsr ?snd
+        lda memb_cur                 ; MEMAC-B back to the engine's invariant
+        sta VBXE_MEMAC_B
+        lda #$40                     ; VBI back on (the OS value: no DLI in this
+        sta NMIEN                    ;   engine, ANTIC playfield DMA is off)
+        cli
+        rts
+?snd    ; A = one sample level -> both ports of the chosen output
+?o1     sta $FFFF                    ; SMC oper : AUDC4 / base+0
+?o2     sta $FFFF                    ; SMC oper : AUDC4 / base+1
+        rts
+?nl     dta 0
+?nh     dta 0
+.endp
+
+prv_vt  dta 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0   ; the 16 levels of the chosen output
+        ert *>DATAW                 ; snd_preview runs with the MEMAC-B window ON: its
+                                    ;   code and prv_vt must sit below $4000

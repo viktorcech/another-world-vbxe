@@ -25,17 +25,16 @@ gtxt_ptr = cr0                       ; $C0-$C1 : string byte ptr (txt_ptr collid
         sta t_sidlo
         lda vm_s2
         sta t_sidhi
-        mfetch
+        mfetch0                      ; (Y = 0 after vm_w)
         sta txt_x
-        mfetch
+        mfetch0
         sta txt_y
-        mfetch
+        mfetch0
         sta txt_col
         ; find table index for strId (linear scan; aw_nstr entries)
         ldx #0
 ?scan   cpx #aw_nstr
-        bcc *+5                      ; in-range; else jmp (?done is >127 B away)
-        jmp ?done                    ; not found -> skip
+        jcs ?done                    ; not found -> skip (a branch when in range)
         lda aw_id_lo,x
         cmp t_sidlo
         bne ?nx
@@ -52,15 +51,41 @@ gtxt_ptr = cr0                       ; $C0-$C1 : string byte ptr (txt_ptr collid
         adc #>aw_strbytes
         sta gtxt_ptr+1
         ; glyph spans go through fill_span (like polygons), so set the same BCB
-        ; constants op_drawpoly does -- page (DST+2) and HEIGHT=0.
-        jsr blit_idle
+        ; constants op_drawpoly does -- page (DST+2) and HEIGHT=0 (no wait: only
+        ; the START waits).
         lda cbase+2
         sta BCB+BCB_DST_ADDR+2
+        sta bcb_pg                   ; (the span BCB page / height shadow)
         lda #0
         sta BCB+BCB_HEIGHT
+        sta bcb_ht
         lda txt_col                  ; PERF: the text colour is constant for the whole string,
         sta poly_color               ;   so set poly_color/scol ONCE here instead of reloading
         sta scol                     ;   them per run in emit_run.
+.if 1
+        ; ... and its BCB mode fields go in ONCE too, so every run of the string takes
+        ; the same fused span path the polygons take (no colour test per run).
+        ldx #$D0                     ; bne: solid / transparent -> the run just STARTs
+        cmp #$11
+        bcc ?tma
+        ldx #$F0                     ; beq: copy mode (the source per run)
+        lda #$11
+?tma    stx draw_scanline_fast.dsf_m
+.ifdef HIRES_CAP
+        stx dsf_sr.dsr_m
+.endif
+        cmp last_scol
+        beq ?tmok
+        jsr span_mode                ; the mode fields for this colour
+?tmok
+.ifdef HIRES_CAP
+        ldx hires                    ; the run's span: LR fused / SR fused
+        lda er_tlo,x
+        sta emit_run.er_go+1
+        lda er_thi,x
+        sta emit_run.er_go+2
+.endif
+.endif
         lda txt_x
         sta t_cx
         jsr set_t_cbx                ; PERF: t_cbx = t_cx*8 computed once per LINE here; ?adv
@@ -68,8 +93,8 @@ gtxt_ptr = cr0                       ; $C0-$C1 : string byte ptr (txt_ptr collid
                                      ;   per-glyph path (see set_t_cbx below).
 ?char   ldy #0
         lda (gtxt_ptr),y
-        bne ?notend
-        jmp ?done                    ; 0x00 terminator
+        beq ?done
+        ;jmp ?done                    ; 0x00 terminator
 ?notend inc gtxt_ptr                 ; ptr++ (16-bit)
         bne ?p1
         inc gtxt_ptr+1
@@ -100,7 +125,29 @@ gtxt_ptr = cr0                       ; $C0-$C1 : string byte ptr (txt_ptr collid
 .endp                                ;   to the fetch loop (vm_cont is gone, fps wave)
 
 ; draw_glyph : render glyph t_ch at column t_cx, row txt_y, colour txt_col.
+.if 1
+        nocross draw_glyph, draw_glyph.gl_row, draw_glyph.gl_end
+.endif
 .proc draw_glyph
+.if 1
+        lda t_ch                     ; fp = aw_font + n*8, n = ch-0x20 (8-bit)
+        sec
+        sbc #$20
+        asl @                        ; n*8 as a 9-bit rotation through C (6502 skill:
+        rol @                        ;   "five lsr for the top bits -> rol the other
+        rol @                        ;   way"): A = n4..n0 0 n7 n6, C = n5
+        tax
+        and #3                       ; hi = n7 n6 n5 = n >> 5  (rol: C = 0 after, the
+        rol @                        ;   top bit shifted out is 0)
+        tay
+        txa
+        and #$F8                     ; lo = n << 3
+        adc #<aw_font                ; (C = 0)
+        sta t_fp
+        tya
+        adc #>aw_font
+        sta t_fp+1
+.else
         lda t_ch                     ; fp = aw_font + (ch-0x20)*8
         sec
         sbc #$20
@@ -120,9 +167,44 @@ gtxt_ptr = cr0                       ; $C0-$C1 : string byte ptr (txt_ptr collid
         lda t_fp+1
         adc #>aw_font
         sta t_fp+1
+.endif
         ; t_cbx (= cx*8, the 320-space base column) is maintained by do_drawstring now --
         ; computed once per line in set_t_cbx, advanced by +8 per glyph at ?adv -- so the old
         ; per-glyph *8 shift chain that lived here is gone (~25-30 cyc saved per drawn glyph).
+.if 1
+        ; The row's bits stay in A (asl @, not asl in memory) and the run state is the
+        ; code position (?out / ?in), not a flag: a loop ends by itself when no set bit
+        ; is left -- the zeros shifted in close a run open to the row edge at i = 8.
+        ldy #0                       ; j = font row (t_j across the runs: emit_run
+?row                                 ;   keeps X only)
+gl_row  sty t_j
+        tya
+        clc
+        adc txt_y                    ; py = txt_y + j
+        cmp #SCRH
+        bcs ?nextrow                 ; py >= 200 -> skip this row
+        sta sy                       ; fill_span row
+        lda (t_fp),y                 ; rowbits = font[fp + j], MSB = pixel 0
+        beq ?nextrow
+        ldx #$FF                     ; X = bit index i
+?out    inx                          ; outside a run: to the next set bit (A != 0,
+        asl @                        ;   so one is ahead)
+        bcc ?out
+        stx t_i0                     ; a run starts at i
+?in     inx                          ; inside: to the next clear bit
+        asl @
+        bcs ?in
+        sta t_rbits                  ; close [t_i0 .. X-1] (emit_run keeps X, not A)
+        jsr emit_run
+        lda t_rbits
+        bne ?out                     ; set bits left
+?nextrow
+        ldy t_j
+        iny                          ; skill-ok LOOPCP: the rows must go top -> bottom
+        cpy #8                       ;   (py = txt_y + j and the span order follow j)
+        bne ?row
+gl_end  rts
+.else
         lda #0
         sta t_j
 ?row    lda txt_y                    ; py = txt_y + j
@@ -162,6 +244,7 @@ gtxt_ptr = cr0                       ; $C0-$C1 : string byte ptr (txt_ptr collid
         cmp #8
         bne ?row
         rts
+.endif
 .endp
 
 ; set_t_cbx : t_cbx = t_cx * 8 (the glyph's 320-space base column). Called once per LINE
@@ -169,6 +252,19 @@ gtxt_ptr = cr0                       ; $C0-$C1 : string byte ptr (txt_ptr collid
 ;   *8 shift chain out of draw_glyph's per-glyph path saves ~25-30 cyc per drawn glyph.
 ;   (game_text now lives at $0900 with ~1.7 KB headroom, so this extra proc fits easily.)
 .proc set_t_cbx
+.if 1
+        lda t_cx                     ; cx*8 as a 9-bit rotation through C (as in
+        asl @                        ;   draw_glyph): A = c4..c0 0 c7 c6, C = c5
+        rol @
+        rol @
+        tax
+        and #$F8                     ; lo = cx << 3 (and keeps C)
+        sta t_cbx
+        txa
+        and #3                       ; hi = c7 c6 c5 = cx >> 5
+        rol @
+        sta t_cbx+1
+.else
         lda t_cx
         sta t_cbx
         lda #0
@@ -179,8 +275,16 @@ gtxt_ptr = cr0                       ; $C0-$C1 : string byte ptr (txt_ptr collid
         rol t_cbx+1
         asl t_cbx
         rol t_cbx+1
+.endif
         rts
 .endp
+
+.if 1
+.ifdef HIRES_CAP
+er_tlo  dta <draw_scanline_fast.es_lrf, <dsf_sr.es_srf   ; the fused span, LR / SR
+er_thi  dta >draw_scanline_fast.es_lrf, >dsf_sr.es_srf
+.endif
+.endif
 
 ; emit_run : draw the run [t_i0 .. X-1] (320-space cols cbx+i0 .. cbx+i1) on the
 ;   current row (sy preset) in colour txt_col, via emit_span (LR x>>1). Preserves X.
@@ -194,8 +298,13 @@ gtxt_ptr = cr0                       ; $C0-$C1 : string byte ptr (txt_ptr collid
         adc #$80
         sta a_hi
         txa                          ; b = cbx + (X-1) + $8000
+.if 1
+        sbc #0                       ; C = 0 here (t_cbx hi <= 1: +$80 never carries), so
+                                     ;   this is the -1; X >= 1 -> no borrow, C = 1
+.else
         sec
         sbc #1
+.endif
         clc
         adc t_cbx
         sta b_lo
@@ -204,9 +313,13 @@ gtxt_ptr = cr0                       ; $C0-$C1 : string byte ptr (txt_ptr collid
         sta b_hi
         ; poly_color/scol are set ONCE per string in do_drawstring now (text colour is
         ; constant across the whole string), so emit_run no longer touches them per run.
-        stx tmp_lo                   ; fill_span clobbers X (ldx sy) -> save it. On a
-        jsr emit_span                ;   6502 a zp cell (3+3) beats txa/pha/pla/tax (11);
-        ldx tmp_lo                   ;   tmp_lo is free across emit_span/fill_span.
+        stx tmp_lo                   ; the span clobbers X (ldx sy) -> save it. On a
+.if 1
+er_go   jsr draw_scanline_fast.es_lrf ;  6502 a zp cell (3+3) beats txa/pha/pla/tax
+.else                                 ;  (11); tmp_lo is free across the span path.
+        jsr emit_span
+.endif
+        ldx tmp_lo
         rts
 .endp
 .else
@@ -278,16 +391,34 @@ LD_HOLD = 50                         ; vblanks the screen is held (~1 s PAL / 0.
         ldx #0
         jsr clear_page
         ; glyph BCB: draw to the displayed page, 1-tall spans (full vertical detail),
-        ; constant colour for the whole string. clear_page left last_scol = $FF, so the
-        ; first fill_span re-patches its mode fields to the solid LD_COL.
-        jsr blit_idle
+        ; constant colour for the whole string (fill_span re-patches the mode fields
+        ; when last_scol differs from LD_COL). No wait: only the START waits.
         lda vm_cur2
         sta BCB+BCB_DST_ADDR+2
+        sta bcb_pg                   ; (the span BCB page / height shadow)
         lda #0
         sta BCB+BCB_HEIGHT
+        sta bcb_ht
         lda #LD_COL
         sta poly_color
         sta scol
+.if 1
+        ldx #$D0                     ; the LOADING colour's mode fields go in once, like
+        stx draw_scanline_fast.dsf_m ;   do_drawstring: every run then takes the fused
+.ifdef HIRES_CAP                     ;   span path (LD_COL is solid, so bne / no copy)
+        stx dsf_sr.dsr_m
+        ldx hires
+        lda er_tlo,x
+        sta emit_run.er_go+1
+        lda er_thi,x
+        sta emit_run.er_go+2
+.endif
+        lda #LD_COL
+        cmp last_scol
+        beq ?lmok
+        jsr span_mode
+?lmok
+.endif
         lda #<ld_str
         sta gtxt_ptr
         lda #>ld_str
@@ -315,7 +446,7 @@ LD_HOLD = 50                         ; vblanks the screen is held (~1 s PAL / 0.
         sta t_cbx
         bcc ?char
         inc t_cbx+1
-        jmp ?char
+        jmp ?char                   ; skill-ok JMPFLAG: a bcs here crosses a page (+1)
 ?done   jsr blit_idle                ; let the last glyph land before we show the page
         lda vm_cur2
         jsr show_page                ; re-assert the displayed page (now the LOADING screen)

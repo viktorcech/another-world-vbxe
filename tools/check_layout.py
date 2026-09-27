@@ -89,6 +89,7 @@ def check_ram(code_end):
         ("SNAP",        0x9600, 0x9600 + 328 + 512),    # thread snapshot + globals + vars (game_vm)
         ("RAMB work",   0x9C00, 0x9C00 + 384 + 256),    # locals..pstk(+384)+256
         ("cc arena tbl",0x9E80, 0x9EA7),                # game_cellcache 5-arena alloc table
+        ("zx02 unpack", 0x9EA8, 0xA000),                # game_unpack.asm (ert-guarded)
         ("fmul tables", 0xA000, 0xA800),
         ("poly LUTs",   0xA800, 0xAA00),
         ("cell cache",  0xAA00, 0xB000),                # game_cellcache.asm (ert-guarded)

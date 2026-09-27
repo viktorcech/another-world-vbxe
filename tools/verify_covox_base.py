@@ -103,8 +103,13 @@ def stub(m, lab):
     """Stop a run at the shared IRQ body with `pla / rts`. Not a bare rts: the
     covox prologue enters after a `pha` that the real tail balances with its own
     `pla / rti`, and the 6502 model keeps one stack for both."""
-    m[lab['body']] = 0x68
-    m[lab['body'] + 1] = 0x60
+    # the stub sits at $06F0 and `body` becomes `jmp $06F0`: that catches both a
+    # `jmp body` and a `jmp (body+1)` (the game player's state is body's operand)
+    m[0x06F0] = 0x68
+    m[0x06F1] = 0x60
+    m[lab['body']] = 0x4C
+    m[lab['body'] + 1] = 0xF0
+    m[lab['body'] + 2] = 0x06
 
 
 def run(mem, lab, entry, a=0, stub_body=True):

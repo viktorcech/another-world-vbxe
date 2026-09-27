@@ -13,6 +13,10 @@ KBCODE  = $D209                     ; r: last keyboard scan code (b6/b7 = shift/
 
 start
         sei
+        cld                         ; D survives reset/interrupt (nmos skill); no sed
+                                    ;   exists in the project, so this ONE clear covers
+                                    ;   the intro AND the game it chains into (the game
+                                    ;   side is byte-frozen: +1 B there cost +126 c/f)
         lda PORTB
         ora #$02                    ; disable BASIC, keep OS ROM
         sta PORTB
@@ -93,6 +97,12 @@ start
                                     ;   the DAC (aw_settings.asm)
 
         jsr snd_init                ; POKEY SFX player : hook Timer 1 IRQ (loading done)
+.if 1
+        jmp replay                  ; (once: the op dispatch's page pad sits before replay)
+.else
+        ert *<>replay && DIAG=0     ; nothing may sit between this and replay: the
+                                    ;   intro FALLS THROUGH into the playlist loop
+.endif
 
 .if DIAG
 ;-----------------------------------------------------------------------------
@@ -140,9 +150,19 @@ start
         jmp ?diag
 .endif
 
+
 ;-----------------------------------------------------------------------------
 ; main : replay the playlist forever
 ;-----------------------------------------------------------------------------
+.if 1
+        nocross key_esc, next_op, op_blit+1  ; the ESC test, the op tests and ALL their
+                                    ;   targets in one page
+key_esc lda KBCODE                  ; a key is held (rare, out of line): ESC skips the
+        and #$3F                    ;   intro (chains straight into the game)
+        cmp #$1C                    ; ESC scan code
+        bne np_top
+        jmp intro_done
+.endif
 replay
         lda #$FF                    ; no palette change pending across a restart
         sta pend_pal
@@ -150,7 +170,7 @@ replay
         sta pace_due
         lda #0
         sta pace_frac               ; NTSC speed-comp accumulator starts empty
-        lda #0                      ; playlist stream ptr = start of $060000:
+        ;lda #0                      ; playlist stream ptr = start of $060000:
         sta pl_wlo                  ;   window $4000, bank $18 (PLAY_BANK0)
         lda #>DATAW
         sta pl_whi
@@ -163,6 +183,24 @@ next_op
         ; live keypress; #$3F strips the shift/ctrl bits. ~7 cyc when idle.
         lda SKSTAT
         and #$04
+.if 1
+        beq key_esc                 ; a key held (rare): the ESC test is out of line
+np_top  m_plbyte                    ; the opcode (inlined read)
+        cmp #$05                    ; DRAWPOLY is most of a playlist -> test it first
+        beq ?dp
+        cmp #$06
+        beq op_blit
+        cmp #$00
+        beq ?fin                    ; END : stop the intro
+        cmp #$01
+        beq op_setpal
+        cmp #$02
+        beq op_selpage
+        cmp #$03
+        beq op_fillpage
+        cmp #$04
+        beq op_copypage
+.else
         bne ?nokey                  ; no key held -> fetch the next op
         lda KBCODE
         and #$3F
@@ -184,13 +222,15 @@ next_op
         beq ?dp
         cmp #$06
         beq op_blit
+.endif
         cmp #$07
         beq ?txt
         cmp #$08
         beq ?snd
         cmp #$09
         beq ?mus
-        jmp next_op
+        jmp next_op                 ; skill-ok JMPFLAG: unknown op (never); a bne back crosses a page
+np_end
 ?dp     jmp op_drawpoly
 ?txt    jmp op_drawtext
 ?snd    jmp op_sound
@@ -231,7 +271,8 @@ op_selpage
 
 op_fillpage
         jsr pl_byte
-        pha
+        pha                          ; skill-ok PHAPLA: as the game's op_fillpage --
+                                     ;   one fetch, a handful of times a frame
         jsr pl_byte
         tax
         pla
@@ -314,32 +355,42 @@ op_blit
 ?bdone  jmp next_op
 
 op_drawpoly
-        jsr pl_byte
+        m_plbyte    
         sta dr_off
-        jsr pl_byte
+        m_plbyte    
         sta dr_off+1
-        jsr pl_byte
+        m_plbyte    
         sta dr_x
-        jsr pl_byte
+        m_plbyte    
         sta dr_x+1
-        jsr pl_byte
+        m_plbyte    
         sta dr_y
-        jsr pl_byte
+        m_plbyte    
         sta dr_y+1
-        jsr pl_byte
+        m_plbyte    
         sta dr_zoom
-        jsr pl_byte
-        sta dr_zoom+1
+        m_plbyte    
+        sta dr_zoom+1               ; (m_plbyte's flags are not A's: the cmp below)
         ; per-shape zoom dispatch : dr_zoom is constant through the whole
         ; poly_draw tree, so pick read_scaled's path ONCE here (SMC operand)
         ; -- zoom==64 (1:1, ~97% of intro shapes) -> rs_fast, no per-coord mul.
         ldx #<rs_fast
         ldy #>rs_fast
-        lda dr_zoom+1
-        bne ?zslow
+        cmp #0                      ; A = dr_zoom+1 still (skill-ok CMP0: N/Z from A)
+        bne ?zhi
         lda dr_zoom
         cmp #64
         beq ?zset
+.if 1
+?zz4    jsr rs_z4_set               ; zoom < 16384 : the per-shape premultiply
+        ldx #<rs_z4
+        ldy #>rs_z4
+        bne ?zset                   ; (Y = >rs_z4 != 0 -> always taken)
+?zhi    cmp #$40
+        bcc ?zz4
+.else
+?zhi
+.endif
 ?zslow  ldx #<rs_slow
         ldy #>rs_slow
 ?zset   stx rs_smc+1
@@ -356,8 +407,94 @@ op_drawpoly
         jsr blit_idle
         lda cbase+2
         sta BCB+BCB_DST_ADDR+2
+.if 1
+pbh_3   lda #0  ; SMC = poly_bcb_h; 0 = 1-tall spans (full) ; 1 = 2-tall (half-res, stock)
+.else
         lda poly_bcb_h              ; 0 = 1-tall spans (full) ; 1 = 2-tall (half-res, stock)
+.endif
         sta BCB+BCB_HEIGHT
         jsr set_poly_ptr            ; dr_off just jumped -> sync the stream pointer
         jsr poly_draw
         jmp next_op
+
+;=============================================================================
+; Playlist fetch : sequential read from VRAM via MEMAC-B.
+;   The intro playlist is STRICTLY LINEAR (no jumps), so keep a running window
+;   pointer (pl_wlo/pl_whi) + bank (pl_bnk) instead of recomputing bank/window
+;   from a 24-bit address every byte. Only the bank CHECK stays per byte
+;   (poly_fetch interleaves and steals the MEMAC-B register between ops).
+;   (Lives here, next to its only caller: the shared decoder has no playlist.)
+;=============================================================================
+; m_plbyte : pl_byte INLINE -- the playlist is read byte by byte and the jsr/rts is
+;   12 of the ~34 cycles. Same instructions, same order; the rare window wrap is the
+;   shared pl_bwrap stub (it preserves A, as pl_byte's tail always did).
+.macro m_plbyte
+        lda pl_bnk
+        cmp memb_cur                ; (#2) only switch the bank if poly stole it
+        beq ?nosw
+        sta memb_cur
+        sta VBXE_MEMAC_B
+?nosw   ldy #0
+        lda (pl_wlo),y              ; A = the playlist byte
+        inc pl_wlo
+        bne ?ok                     ; ~1/256 : window page crossed
+        jsr pl_bwrap
+?ok
+.endm
+
+.proc pl_bwrap                      ; window page crossed: advance it (A preserved)
+        pha
+        inc pl_whi
+        lda pl_whi
+        cmp #$80                    ; past $7FFF (16 KB window end)?
+        bne ?nb
+        lda #>DATAW                 ; window back to $4000, next bank
+        sta pl_whi
+        inc pl_bnk
+        lda pl_bnk
+        sta memb_cur
+        sta VBXE_MEMAC_B
+?nb     pla
+        rts
+.endp
+
+.if 1
+.proc pl_byte                       ; the jsr-able form (cold callers)
+        lda pl_bnk
+        cmp memb_cur                ; (#2) only switch the bank if poly stole it
+        beq ?nosw
+        sta memb_cur
+        sta VBXE_MEMAC_B
+?nosw   ldy #0
+        lda (pl_wlo),y              ; A = the playlist byte
+        inc pl_wlo
+        beq pl_bwrap                ; ~1/256: the window page crossed (tail: its rts returns)
+        rts
+.endp
+.else
+.proc pl_byte
+        lda pl_bnk
+        cmp memb_cur                ; (#2) only switch the bank if poly stole it
+        beq ?nosw
+        sta memb_cur
+        sta VBXE_MEMAC_B
+?nosw   ldy #0
+        lda (pl_wlo),y              ; A = the playlist byte (return value)
+        inc pl_wlo
+        beq ?wrap
+        rts
+?wrap   pha                         ; window page crossed (~1/256 reads)
+        inc pl_whi
+        lda pl_whi
+        cmp #$80                    ; past $7FFF (16 KB window end)?
+        bne ?nb
+        lda #>DATAW                 ; window back to $4000, next bank
+        sta pl_whi
+        inc pl_bnk
+        lda pl_bnk
+        sta memb_cur
+        sta VBXE_MEMAC_B
+?nb     pla
+        rts
+.endp
+.endif

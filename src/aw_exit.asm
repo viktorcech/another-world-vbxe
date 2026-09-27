@@ -52,7 +52,7 @@ nv_len  equ *-nv_msg
 ; the variables live at the END of the loader. An earlier revision of these three
 ; equates assumed the opposite (vars right behind the header) -- the chain then wrote
 ; cur_sec/buf_pos straight over `lda #$00 / sta SDMCTL` and jumped into the middle of
-; `sta $D400`, so the game never came up after the intro. tools/make_full_atr.py now
+; `sta $D400`, so the game never came up after the intro. tools/buildstep_join_disk.py now
 ; re-derives all three from the assembled boot.bin and fails the build on a mismatch,
 ; so this can never silently drift again.
 BOOT_CURSEC equ $083A               ; bootloader.asm: cur_sec (word)

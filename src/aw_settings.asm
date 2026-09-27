@@ -101,8 +101,7 @@ NOPT    = 5                          ; POKEY + four covox bases
         sta cur_draw
         jsr set_cbase_cur
         lda set_sel
-        jsr snd_set_mode             ; hand the answer to snd_init (and the game)
-        rts
+        ert *<>snd_set_mode          ; (falls into snd_set_mode: it follows)
 .endp
 
 ;-----------------------------------------------------------------------------
@@ -119,191 +118,6 @@ NOPT    = 5                          ; POKEY + four covox bases
         rts
 .endp
 
-;-----------------------------------------------------------------------------
-; snd_preview : play ONE random GAME sound through the CURRENTLY SELECTED output.
-;
-;   This is the only honest test for the three PBI bases -- they cannot be probed
-;   (see the header), so the answer is "press OPTION and listen". The sounds are
-;   real game SFX, baked into this build by tools/gen_test_sfx.py because the
-;   menu runs long before any game data is on the machine; they sit in the dead
-;   tail of the last music VRAM bank. A beep would only prove that a wire is
-;   connected -- this walks a real sample stream, through the same volume curve,
-;   around the same mix centre as the IRQ does in the game. The pacing is a delay
-;   loop instead of Timer 1, because at menu time the IRQ is not hooked yet and
-;   snd_go_covox -- a ONE-WAY switch -- must not happen until the user has
-;   actually chosen.
-;
-;   $D280 with the probe saying NONE is deliberately SILENT. There, base+1 is
-;   AUDC1 on a stock POKEY and the linear covox curve (n*8 + 64) has volume bits
-;   set in half its entries, so playing it would make POKEY noise and the user
-;   would "hear a covox" that three probes just proved is not there. The other
-;   three bases need no such care: nothing else in the machine answers them.
-;
-;   ~444 cycles per nibble = the ~3995 Hz the samples were baked at. Each sound
-;   is under half a second by construction, and the window-end check is a belt-
-;   and-braces stop: nothing here walks a bank list the way the IRQ does.
-;
-;   The covox path parks base+2/base+3 at mid rail first. This is the ONLY place
-;   that has to do it itself: on a 4-channel card those two channels sum into the
-;   same two outputs the driven pair feeds, and at menu time nothing in the
-;   machine has ever written them -- on real hardware they hold whatever the
-;   latches powered up with. snd_go_covox does the same, but only at snd_init,
-;   which is after START.
-;-----------------------------------------------------------------------------
-; Delay iterations. The two halves of the inner loop are NOT symmetric: after
-; the LOW nibble the loop also does inc ?rd+1 / inc ?nl / jmp / the window-end
-; check / the byte fetch and unpack -- 39 cycles the HIGH nibble's half does not
-; pay. With one constant for both the sample clock alternated 426 / 465 cycles,
-; an 8.8% square-wave modulation at exactly Fs/2 = 2009 Hz: a whistling tone laid
-; over every test sound, on POKEY and covox alike (they share ?snd). Measured on
-; the assembled bytes, the two halves are
-;     A = 5*PRV_DH + 31      (hi -> lo nibble)
-;     B = 5*PRV_DL + 70      (lo -> hi nibble)
-; so PRV_DL has to run 8 iterations short. 83/75 gives 446 / 445 -- one cycle
-; apart, and the mean period stays 445.5 cycles = the ~4 kHz the samples were
-; baked at. The IRQ-driven players do not need this: Timer 1 is exact by
-; construction, which is why only the menu's test tone ever whistled.
-PRV_DH  = 83                         ; hi -> lo nibble
-PRV_DL  = 75                         ; lo -> hi nibble: 39 cycles of loop tail
-
-.proc snd_preview
-        lda #0
-        sta AUDCTL
-        sta AUDC1
-        sta AUDC2
-        sta AUDC3
-        sta AUDC4
-        lda #3
-        sta SKCTL                    ; RANDOM below needs the polys running
-        ; --- where does it go, and is it worth writing there at all? ---
-        ldx set_sel
-        beq ?pokey
-        cpx #1
-        bne ?cv                      ; $D500/$D600/$D700: nothing else answers
-        lda pm_seen                  ; $D280: only when the probe found a card --
-        bne ?cv                      ;   see the header
-        rts                          ;   NONE: stay silent rather than answer with
-                                     ;   POKEY noise the user would misread
-?cv     dex                          ; 1..4 -> covox base index 0..3
-        lda cv_bhi,x                 ; the page is the same for all four ports
-        sta ?o1+2
-        sta ?o2+2
-        lda cv_blo,x                 ; --- the pair this player does NOT drive:
-        clc                          ;     park it at MID RAIL, once, before the
-        adc #2                       ;     first sample. On a 4-channel card the
-        sta ?o1+1                    ;     pairs SUM into one output each, so a
-        adc #1                       ;     channel still holding its power-on
-        sta ?o2+1                    ;     value drags the analogue sum off
-        lda #$80                     ;     centre and can clip the whole test
-        jsr ?snd                     ;     tone. snd_go_covox parks them too, but
-                                     ;     that runs at snd_init -- AFTER this
-                                     ;     menu, so the test sound is the one
-                                     ;     place nothing has ever written them.
-        lda cv_blo,x                 ; --- and now the driven pair
-        sta ?o1+1
-        clc
-        adc #1                       ; base+0 = left, base+1 = right
-        sta ?o2+1
-        ldy #15                      ; the LINEAR curve at full volume, lifted by
-?cl     lda voltab8+15*16,y          ;   the 64 the mix tail adds for a silent
-        clc                          ;   music voice -- so the DAC swings around
-        adc #64                      ;   $80 exactly as it does in the intro
-        sta prv_vt,y
-        dey
-        bpl ?cl
-        jmp ?dup
-?pokey  lda #<AUDC4                  ; the SFX voice, volume-only like the player
-        sta ?o1+1
-        sta ?o2+1
-        lda #>AUDC4
-        sta ?o1+2
-        sta ?o2+2
-        ldy #15
-?pl     lda voltab+15*16,y           ; already $10-ORed for AUDC volume-only
-        sta prv_vt,y
-        dey
-        bpl ?pl
-?dup    ; --- pick one of the baked GAME sounds (tools/gen_test_sfx.py) --------
-        lda RANDOM
-        and #$0F                     ; 0..15
-        cmp #TST_COUNT
-        bcc ?rok
-        sbc #TST_COUNT               ; fold the rest down. NOT a re-roll loop: a
-?rok    tax                          ;   frozen RANDOM ($FF) would spin forever
-        lda #TST_BANK
-        sta VBXE_MEMAC_B             ; window $4000 -> the bank they were baked in
-        lda tst_winlo,x              ;   (one bank for all of them: no walk)
-        sta ?rd+1
-        lda tst_winhi,x
-        sta ?rd+2
-        sec                          ; count = -len : the loop counts UP to $0000
-        lda #0
-        sbc tst_lenlo,x
-        sta ?nl
-        lda #0
-        sbc tst_lenhi,x
-        sta ?nh
-        sei                          ; the OS VBI would warble the sample clock --
-        lda #0                       ;   and SEI does not mask NMI, so the VBI has
-        sta NMIEN                    ;   to go too: ~1000 cycles stolen 50x a second
-                                     ;   is an audible tick on a 4 kHz stream. Safe
-                                     ;   for the ~0.45 s this runs: ANTIC playfield
-                                     ;   DMA is already off (SDMCTL = 0), the display
-                                     ;   is XDL-driven, read_console polls CONSOL
-                                     ;   itself, and nothing here needs RTCLOK. The
-                                     ;   real covox players do the same (examples/
-                                     ;   players/inertia_player_4.5: jsr os_off).
-?loop   lda ?rd+2
-        cmp #$80
-        bcs ?end                     ; ran into the next bank: stop, no walk
-?rd     lda $FFFF                    ; SMC : the sample byte -- 2 nibbles, hi first
-        tax
-        lsr @
-        lsr @
-        lsr @
-        lsr @
-        tay
-        lda prv_vt,y
-        jsr ?snd
-        ldy #PRV_DH
-?dh     dey
-        bne ?dh
-        txa
-        and #$0F
-        tay
-        lda prv_vt,y
-        jsr ?snd
-        inc ?rd+1
-        bne ?ct
-        inc ?rd+2
-?ct     inc ?nl
-        bne ?more
-        inc ?nh
-        beq ?end
-?more   ldy #PRV_DL                  ; 8 short: this half carries the loop tail
-?dl     dey
-        bne ?dl
-        jmp ?loop
-?end    lda #$80                     ; park: covox mid rail ...
-        ldx set_sel
-        bne ?pk
-        lda #0                       ;   ... or POKEY volume off
-?pk     jsr ?snd
-        lda memb_cur                 ; MEMAC-B back to the engine's invariant
-        sta VBXE_MEMAC_B
-        lda #$40                     ; VBI back on (the OS value: no DLI in this
-        sta NMIEN                    ;   engine, ANTIC playfield DMA is off)
-        cli
-        rts
-?snd    ; A = one sample level -> both ports of the chosen output
-?o1     sta $FFFF                    ; SMC oper : AUDC4 / base+0
-?o2     sta $FFFF                    ; SMC oper : AUDC4 / base+1
-        rts
-?nl     dta 0
-?nh     dta 0
-.endp
-
-prv_vt  dta 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0   ; the 16 levels of the chosen output
 
 ;-----------------------------------------------------------------------------
 ; text_setup : BCB constants for the glyph BSTENCIL blits (copied from
@@ -389,8 +203,8 @@ prv_vt  dta 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0   ; the 16 levels of the chosen outp
         lda #1
         jsr draw_one
         ldx ?i
-        inx
-        cpx #NSTR
+        inx                          ; skill-ok LOOPCP: the menu lines are drawn top
+        cpx #NSTR                    ;   to bottom
         bne ?l
         ldx #NSTR                    ; the verdict sits past the static lines
         lda pm_seen
@@ -415,7 +229,7 @@ prv_vt  dta 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0   ; the 16 levels of the chosen outp
         lda #2
 ?w      jsr draw_one
         ldx ?i
-        inx
+        inx                          ; skill-ok LOOPCP: the options are drawn in order
         cpx #NOPT
         bne ?l
         rts
@@ -471,11 +285,11 @@ prv_vt  dta 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0   ; the 16 levels of the chosen outp
         sta VBXE_CB                  ; idx0 : dark-blue background
         lda #$F0
         sta VBXE_CR
-        lda #$F0
+        ;lda #$F0
         sta VBXE_CG
-        lda #$F0
+        ;lda #$F0
         sta VBXE_CB                  ; idx1 : white
-        lda #$F0
+        ;lda #$F0
         sta VBXE_CR
         lda #$D0
         sta VBXE_CG

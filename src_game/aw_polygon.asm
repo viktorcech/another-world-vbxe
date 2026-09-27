@@ -12,22 +12,6 @@
 ; routine is gone too -- its body, incl. the bank re-own, is inlined at vm_fetch
 ; in game_vm_sched.asm, and every mid-opcode caller now uses mfetch.)
 
-; pl_wrap : handle the rare pointer wrap (256-byte page / 16K bank). Preserves A.
-.proc pl_wrap
-        pha
-        inc pl_whi
-        lda pl_whi
-        cmp #$80                    ; past $7FFF -> next bank
-        bne ?nc
-        lda #>DATAW
-        sta pl_whi
-        inc pl_bank
-        lda pl_bank
-        sta memb_cur
-        sta VBXE_MEMAC_B
-?nc     pla
-        rts
-.endp
 
 ; mfetch : inline operand-byte fetch (A = byte, advance the pointer). Used WITHIN an
 ;   opcode, where no draw can have stolen the bank -> no bank re-own needed. (aw3)
@@ -39,10 +23,40 @@
         jsr pl_wrap
 .endm
 
+; mfetch0 : mfetch where Y is already 0 -- the VM handlers' invariant: vm_fetch
+;   dispatches through X and leaves Y = 0, mfetch / pl_wrap never change it.
+.macro mfetch0
+.if 1
+        lda (pl_wlo),y              ; Y = 0 (VM handler invariant)
+.else
+        ldy #0
+        lda (pl_wlo),y
+.endif
+        inc pl_wlo
+        bne *+5
+        jsr pl_wrap
+.endm
+
+; x-variants (tools/_stub_fetch.py): the common no-wrap case falls through a NOT-taken
+;   beq (2 cycles, not 3); :1 = the out-of-line stub `jsr pl_wrap / jmp back`.
+.macro mfetch0x
+        lda (pl_wlo),y              ; Y = 0 (VM handler invariant)
+        inc pl_wlo
+        beq :1
+.endm
+.macro mfetchx
+        ldy #0
+        lda (pl_wlo),y
+        inc pl_wlo
+        beq :1
+.endm
+
 ; set_pl_ptr : sync pl_bank + the running window pointer (pl_whi:pl_wlo) from the
 ;   logical PC (pl_mid:pl_lo). Call on every PC JUMP (thread entry, jmp/call/ret/
 ;   djnz/condjmp) -- not per byte. bank = PLAY_BANK0 + (pc>>14), window = $4000 +
 ;   (pc & $3FFF); reuses the poly LUTs (offset to the PLAY_BANK0 base).
+.if 1
+.else
 .proc set_pl_ptr
         ldx pl_mid
         lda poly_bank_lut,x         ; ((hi>>6)+POLY_BANK0)|$80
@@ -55,6 +69,7 @@
         sta pl_wlo
         rts
 .endp
+.endif
 
 ;=============================================================================
 ; Poly data fetch  (from VRAM via MEMAC-B)
@@ -110,6 +125,11 @@
 ;   at poly_draw entry and re-established after every do_hier child draw; kept by
 ;   pf_wrap (no Y), rs_fast, rs_z4 (restores it), rs_slow/poly_fetch/mul_zoom
 ;   (fmul uses X only) and set_poly_ptr. The sound IRQs never touch Y.
+.macro m_pfetchx                     ; m_pfetch with the wrap out of line (:1 = the
+        lda (pb_ptr),y              ;   stub `jsr pf_wrap / jmp back`), Y = 0
+        inc pb_ptr
+        beq :1
+.endm
 .macro m_pfetch
 .if 1
         lda (pb_ptr),y              ; Y = 0 (decoder invariant)
@@ -126,18 +146,17 @@
 ;   window check preserves it with pha/pla -- paid only ~1/256 reads. Shared by
 ;   poly_fetch (fallthrough target) and rs_fast (jsr).
 .proc pf_wrap
-        pha
-        inc pb_ptr+1
-        lda pb_ptr+1
-        cmp #$80                    ; crossed past $7FFF (16 KB window end)?
-        bne ?nc
+        inc pb_ptr+1                ; $40..$7F: $80 (N = 1) = crossed past $7FFF, the
+        bmi ?nb                     ;   16 KB window end (no pha/lda/cmp on the page
+        rts                         ;   step -- A is untouched)
+?nb     pha
         lda #>DATAW                 ; reset window to $4000, advance to next bank
         sta pb_ptr+1
         inc poly_bnk
         lda poly_bnk
         sta memb_cur
         sta VBXE_MEMAC_B
-?nc     pla
+        pla
         rts
 .endp
 
@@ -162,7 +181,10 @@
         sta dr_off
         rts
 .endp
+.if 1                               ; (pf_bank_hi lives in the $0F80 block, aw_raster.asm)
+.else
 pf_bank_hi dta $00,$40,$80,$C0
+.endif
 
 ;=============================================================================
 ; zoom scale :  scaled = (mul_m * dr_zoom) >> 6
@@ -392,6 +414,9 @@ fzl_4   sbc fmul_sq2h,y
         ; even an 8-bit one"): z4 = zoom << 2 with the low byte shifted IN A; only the high
         ; byte's carry-in goes through memory. The lo/hi copy + 2 of the 4 RMW shifts are
         ; gone (-16 cyc per zoomed shape). Same z4, same patches.
+        ; (a same-zoom early-out was tried 2026-09-25 and MEASURED WORSE: the parts'
+        ;  zoomed shapes repeat a zoom too rarely, and the extra bytes cost page
+        ;  crossings -- gate +129 cyc/frame -> reverted, per "bit-identical or measured")
         lda dr_zoom+1
         sta tmp_hi
         lda dr_zoom
@@ -480,90 +505,8 @@ fmlb_h2 sbc fmul_sq2h,x
 ;        old 4-byte eor/adc negate pass is gone too. Same values, same wrap.
 ;=============================================================================
 .if 1
-.proc calc_step
-        stx ?xsv                    ; the fmul calls below clobber X
-        lda #0
-        sta dvsign
-        lda dv_hi
-        bpl ?abs
-        sec                         ; |dx| = -dv_lo (|dx| < 256 measured, so the
-        lda #0                      ;   low byte is the whole magnitude -- the old
-        sbc dv_lo                   ;   code negated dv_hi too but never read it)
-        sta dv_lo
-        lda #1
-        sta dvsign
-?abs    ldy hh                      ; hh rides in Y through both multiplies (fmul_b
-        cpy #1                      ;   uses X only) -- skill pass: was `ldx hh` twice
-        bne ?mul
-        lda #0                      ; dy==1 : slope = |dx| << 16 -> N = 0,0,|dx|
-        sta g_N0
-        sta N1
-        lda dv_lo
-        sta g_N2
-        jmp ?wr
-?mul    ; slope = |dx| * recip[hh], recip 16-bit -> two fmulu 8x8 multiplies:
-        ;   N(24b) = (|dx|*recip_lo) + (|dx|*recip_hi << 8). |dx| is set once.
-        lda dv_lo
-        jsr fmul_seta               ; a = |dx|  (patched once for both mul-b)
-        lda recip_lo,y
-        tax                         ; b = recip_lo
-        jsr fmul_b                  ; p0 = |dx| * recip_lo
-        lda qp_lo
-        sta g_N0
-        lda qp_hi
-        sta N1
-        lda recip_hi,y
-        tax                         ; b = recip_hi
-        jsr fmul_b                  ; p1 = |dx| * recip_hi
-        lda N1
-        clc
-        adc qp_lo
-        sta N1
-        lda qp_hi
-        adc #0
-        sta g_N2                    ; N3 is implicit 0 (byte 3 is emitted below)
-?wr     ldx ?xsv                    ; write-out: straight into the ?row SMC adc
-        lda dvsign                  ;   operands (X selects the cr / cl chain)
-        bne ?neg
-        lda g_N0
-        sta fill_poly_int.smc_cr0+1,x
-        lda N1
-        sta fill_poly_int.smc_cr1+1,x
-        lda g_N2
-        sta fill_poly_int.smc_cr2+1,x
-        lda #0
-        sta fill_poly_int.smc_cr3+1,x
-        beq ?dbl                    ; (A = 0 -> always taken)
-?neg    sec                         ; step = 0 - N (32-bit, borrow-chained);
-        lda #0                      ;   byte3 = 0-0-borrow = the sign extension
-        sbc g_N0
-        sta fill_poly_int.smc_cr0+1,x
-        lda #0
-        sbc N1
-        sta fill_poly_int.smc_cr1+1,x
-        lda #0
-        sbc g_N2
-        sta fill_poly_int.smc_cr2+1,x
-        lda #0
-        sbc #0
-        sta fill_poly_int.smc_cr3+1,x
-?dbl    lda poly_bcb_h              ; half mode (fps wave 2): the paired row loop
-        beq ?ret                    ;   also needs step*2 in the smc2 chain. The
-        lda fill_poly_int.smc_cr0+1,x   ; asl/rol pass over the 4 bytes just
-        asl @                           ; written = (step << 1) mod 2^32, sign-
-        sta fill_poly_int.smc2_cr0+1,x  ; agnostic (two's complement doubles the
-        lda fill_poly_int.smc_cr1+1,x   ; same way). X still selects cr/cl.
-        rol @
-        sta fill_poly_int.smc2_cr1+1,x
-        lda fill_poly_int.smc_cr2+1,x
-        rol @
-        sta fill_poly_int.smc2_cr2+1,x
-        lda fill_poly_int.smc_cr3+1,x
-        rol @
-        sta fill_poly_int.smc2_cr3+1,x
-?ret    rts
-?xsv    dta 0
-.endp
+; (the game's calc_step is inline in fill_poly_int, src_game/aw_raster.asm: one copy
+;  per edge on absolute SMC operands -- no call, no X save, no abs,x)
 .else
 .proc calc_step
         stx ?xsv                    ; the fmul calls below clobber X
@@ -661,7 +604,12 @@ fmlb_h2 sbc fmul_sq2h,x
 .if 1
 .proc poly_draw
         ldy #0                      ; the decoder's Y = 0 invariant (see m_pfetch)
+.if 1
+        m_pfetchx sfw17                    ; A = byte0 ; dr_off++  (inlined poly_fetch)
+sfr17
+.else
         m_pfetch                    ; A = byte0 ; dr_off++  (inlined poly_fetch)
+.endif
         cmp #$C0
         bcc ?notfill
         ; filled polygon : col = (dr_col&0x80) ? (byte0&0x3F) : dr_col
@@ -672,6 +620,10 @@ fmlb_h2 sbc fmul_sq2h,x
         and #$3F
         sta fill_col
         jmp do_fill
+.if 1
+sfw17   jsr pf_wrap
+        jmp sfr17
+.endif
 ?usecol lda dr_col
         sta fill_col
         jmp do_fill
@@ -711,48 +663,118 @@ fmlb_h2 sbc fmul_sq2h,x
 
 ; do_fill : read bbox + vertices, build the point list, rasterise.
 .if 1
+        nocross2 do_fill, do_fill.df_bc, do_fill.df_vye, do_fill.df_ylo, do_fill.df_yno
 .proc do_fill
-        jsr read_scaled             ; bbw  (A = scaled_lo, read_scaled contract)
+        lda rs_smc+1                ; ONE zoom test per fill: zoom 64 (rs_fast) reads the
+        cmp #<rs_slow               ;   stream inline below; rs_z4 / rs_slow go out of
+        jcs ?gen                    ;   line (lo bytes rs_fast < rs_slow < rs_z4, one page)
+.if 1
+        m_pfetchx sfw32                    ; bbw = byte, hi 0 (Y = 0, the decoder invariant)
+sfr32
+.else
+        m_pfetch                    ; bbw = byte, hi 0 (Y = 0, the decoder invariant)
+.endif
         sta bbw
-        lda g_scaled_hi
-        sta bbw+1
-        jsr read_scaled             ; bbh
-        sta bbh
-        lda g_scaled_hi
-        sta bbh+1
-        m_pfetch                    ; n verts (inlined poly_fetch)
-        sta nverts
-        ; g_x0 = dr_x - bbw/2
-        ; (skill pass 2026-09-09: the half-width is composed in A/X and subtracted as
-        ;  dr_x + ~half + 1 -- `eor #$FF / sec / adc` is bit- and carry-identical to
-        ;  `lda dr_x / sec / sbc half` -- so the tmp_lo/tmp_hi round-trip is gone.)
-        lda bbw+1
-        lsr @
-        tax                         ; X = half hi ; C = bit 0 -> the lo ror
-        lda bbw
-        ror @
-        eor #$FF
+        sty bbw+1
+        lsr @                       ; g_x0 = dr_x - bbw/2 (half hi = 0):
+        eor #$FF                    ;   dr_x + ~half + 1, then dr_x+1 + $FF + C
         sec
-        adc dr_x                    ; = dr_x - half_lo, borrow in C
+        adc dr_x
         sta g_x0
-        txa
-        eor #$FF
-        adc dr_x+1                  ; = dr_x+1 - half_hi - borrow
+        lda dr_x+1
+        adc #$FF
         sta g_x0+1
-        ; g_y0 = dr_y - bbh/2
-        lda bbh+1
-        lsr @
-        tax
-        lda bbh
-        ror @
+.if 1
+        m_pfetchx sfw24                    ; bbh
+sfr24
+.else
+        m_pfetch                    ; bbh
+.endif
+        sta bbh
+        sty bbh+1
+        lsr @                       ; g_y0 = dr_y - bbh/2
         eor #$FF
         sec
         adc dr_y
         sta g_y0
-        txa
-        eor #$FF
-        adc dr_y+1
+        lda dr_y+1
+        adc #$FF
         sta g_y0+1
+.if 1
+        m_pfetchx sfw18                    ; n verts
+sfr18
+.else
+        m_pfetch                    ; n verts
+.endif
+        sta nverts
+        ldx #0                      ; X = vertex index
+        asl @                       ; the 2n vertex bytes are read (pb),y and the pointer
+        bcs ?vlf                    ;   moves once after -- unless they may run past the
+        adc pb_ptr                  ;   window end ($7FFF), or n >= 128 (Y would wrap).
+        bcc df_vy                   ;   C = 0 here.
+df_bc   lda pb_ptr+1
+        cmp #$7F
+        beq ?vlf                    ; last window page + a page cross: byte by byte
+df_vy   lda (pb_ptr),y              ; px = g_x0 + byte
+        iny
+        clc
+        adc g_x0
+        sta pts_xlo,x
+        lda g_x0+1
+        adc #0
+        sta pts_xhi,x
+        lda (pb_ptr),y              ; py = g_y0 + byte
+        iny
+        clc
+        adc g_y0
+        sta pts_ylo,x
+        lda g_y0+1
+        adc #0
+        sta pts_yhi,x
+        inx
+        cpx nverts
+        bne df_vy
+df_vye  tya                         ; pb_ptr += 2n, the window wrap as the byte
+        clc                         ;   fetch does it (pf_wrap on a low-byte wrap)
+        adc pb_ptr
+        sta pb_ptr
+        ldy #0                      ; the decoder's Y = 0 invariant
+        bcc df_disp
+        jsr pf_wrap                 ; (rare window cross)
+        jmp df_disp
+.if 1
+sfw32   jsr pf_wrap
+        jmp sfr32
+sfw24   jsr pf_wrap
+        jmp sfr24
+.endif
+.if 1
+sfw18   jsr pf_wrap
+        jmp sfr18
+.endif
+?vlf    lda (pb_ptr),y              ; px = g_x0 + byte
+        inc pb_ptr
+        bne ?f1
+        jsr pf_wrap                 ; (rare window cross, keeps A)
+?f1     clc
+        adc g_x0
+        sta pts_xlo,x
+        lda g_x0+1
+        adc #0
+        sta pts_xhi,x
+        lda (pb_ptr),y              ; py = g_y0 + byte
+        inc pb_ptr
+        bne ?f2
+        jsr pf_wrap
+?f2     clc
+        adc g_y0
+        sta pts_ylo,x
+        lda g_y0+1
+        adc #0
+        sta pts_yhi,x
+        inx
+        cpx nverts
+        bne ?vlf
         ; --- per-shape clip dispatch (SMC), 3-way -- Y and X tested INDEPENDENTLY so a
         ; shape that is fully on-screen VERTICALLY can skip the per-row y-test even when it
         ; still needs horizontal clipping:
@@ -762,18 +784,18 @@ fmlb_h2 sbc fmul_sq2h,x
         ; 1-px X margin (x0>=1, x1<=318) as before -- the recip-LUT edge walk can overshoot
         ; the hull by <1px. y is an exact integer row walk, so no Y margin is needed.
         ; --- Y in range?  y0 >= 0  AND  y1 = y0+bbh <= 199 ---
-        lda g_y0+1
-        bmi ?yno                    ; y0 < 0
-        bne ?yno                    ; y0 >= 256 (y1 then can't be <= 199)
+df_disp lda g_y0+1
+        bmi df_yno                  ; y0 < 0
+df_ylo  bne df_yno                  ; y0 >= 256 (y1 then can't be <= 199)
         lda g_y0
         clc
         adc bbh
         tax                         ; y1 lo kept in X (skill pass: no tmp_lo round-trip)
         lda g_y0+1
         adc bbh+1
-        bne ?yno                    ; y1 >= 256
+        bne df_yno                  ; y1 >= 256
         cpx #SCRH
-        bcs ?yno                    ; y1 >= 200
+        bcs df_yno                  ; y1 >= 200
         ; Y is fully on-screen. --- X in range?  x0 >= 1  AND  x1 = x0+bbw <= 318 ---
         lda g_x0+1
         bmi ?yokx                   ; x0 < 0 -> X-clip needed
@@ -791,55 +813,112 @@ fmlb_h2 sbc fmul_sq2h,x
         bne ?yokx                   ; x1 >= 512
         cpx #$3F
         bcs ?yokx                   ; x1 >= 319 (margin wants <= 318)
-?fast   ldx #<draw_scanline_fast    ; Y && X in range
+?fast   lda #<draw_scanline_fast    ; Y && X in range. The dispatch sites keep the
+        cmp fill_poly_int.smc_dsl+1 ;   last class (usually the same): unchanged ->
+        beq ?gnab                   ;   no stores (on-screen: no bake guard either)
         ldy #>draw_scanline_fast
-        bne ?gyes                   ; (Y = >draw_scanline_fast != 0 -> always taken)
-?yokx   ldx #<draw_scanline_yok     ; Y in range, X needs clipping -> skip the y-test only
+        bne ?gyes                   ; (Y != 0: always)
+?yokx   lda #<draw_scanline_yok     ; Y in range, X needs clipping -> skip the y-test only
+        cmp fill_poly_int.smc_dsl+1
+        beq ?gbk
         ldy #>draw_scanline_yok
-?gyes   lda #<fill_poly_int.yk_row  ; Y fully on-screen -> ALSO skip the per-ROW
-        sta fill_poly_int.smc_yj+1  ;   y-bounds test in the ?row loop (fps wave):
-        lda #>fill_poly_int.yk_row  ;   hy provably stays in 0..199, so the ~11-cyc
-        sta fill_poly_int.smc_yj+2  ;   test is dead weight on every scanline
-        jmp ?gset
-?yno    ldx #<draw_scanline         ; Y not fully on-screen -> full per-row y-test + X-clip
+?gyes   ldx #<fill_poly_int.yk_row  ; Y fully on-screen -> ALSO skip the per-ROW
+        stx fill_poly_int.smc_yj+1  ;   y-bounds test in the ?row loop (fps wave):
+        ldx #>fill_poly_int.yk_row  ;   hy provably stays in 0..199
+        bne ?gset                   ; (X != 0: always)
+df_yno  lda #<draw_scanline         ; Y not fully on-screen -> full per-row y-test + X-clip
+        cmp fill_poly_int.smc_dsl+1
+        beq ?gbk
         ldy #>draw_scanline
-        lda #<fill_poly_int.yk_tst  ; keep the per-row y-test (early exit past the
-        sta fill_poly_int.smc_yj+1  ;   bottom edge / skip above the top)
-        lda #>fill_poly_int.yk_tst
-        sta fill_poly_int.smc_yj+2
-?gset   stx fill_poly_int.smc_dsl+1
+        ldx #<fill_poly_int.yk_tst  ; keep the per-row y-test (early exit past the
+        stx fill_poly_int.smc_yj+1  ;   bottom edge / skip above the top)
+        ldx #>fill_poly_int.yk_tst
+?gset   stx fill_poly_int.smc_yj+2
+        sta fill_poly_int.smc_dsl+1
         sty fill_poly_int.smc_dsl+2
-        stx fill_poly_int.smc_dsh+1 ; the half-mode paired loop has two more
+        sta fill_poly_int.smc_dsh+1 ; the half-mode paired loop has two more
         sty fill_poly_int.smc_dsh+2 ;   dispatched draw sites (pair + odd-exit
-        stx fill_poly_int.smc_dsi+1 ;   row) -- patch them to the same target
+        sta fill_poly_int.smc_dsi+1 ;   row) -- patch them to the same target
         sty fill_poly_int.smc_dsi+2
+        ldy #0                      ; the decoder's Y = 0 invariant (miss path only)
+        cmp #<draw_scanline_fast
+        beq ?gnab                   ; fast dispatch = bbox fully on-screen, safe
+        ert <draw_scanline_fast=<draw_scanline_yok   ; the low byte alone tells the
+        ert <draw_scanline_fast=<draw_scanline       ;   three targets apart (memo)
+        ert <draw_scanline_yok=<draw_scanline
         ; --- cell-cache bake guard: a fill on the CLIP dispatch may lose
         ; content silently (a child fully off-screen at the bake position
         ; emits NO spans -> the extents can't see it) -> the shape must not
         ; be cached. ~10 cyc per fill when not baking.
-        cpx #<draw_scanline_fast
-        bne ?gbk
-        cpy #>draw_scanline_fast
-        beq ?gnab                   ; fast dispatch = bbox fully on-screen, safe
-?gbk    lda cc_baking
+?gbk
+.ifdef CELLCACHE
+        lda cc_baking               ; (GAME only: the intro has no cell cache)
         beq ?gnab
         lda cc_flag
         ora #$80                    ; abort the bake -> NEVER
         sta cc_flag
-?gnab   ldy #0                      ; the dispatch above used Y -> restore the decoder's
-        ldx #0                      ;   Y = 0 invariant before the fetches; X = vertex
-                                    ;   index, kept LIVE across read_scaled
-                                    ;   (fps wave: rs_fast/rs_z4/rs_slow all preserve
-                                    ;   X now) -- the old pha/tay/ldx/pla shuffle and
-                                    ;   the g_vidx memory cell are gone (~35 cyc/vert)
-?vl     jsr read_scaled             ; px = g_x0 + scaled  (A = scaled_lo)
+.endif
+?gnab   jmp fill_poly_int
+?gen    bne ?gz                     ; C = 1 ; Z = rs_slow (zoom >= 16384, never in practice):
+        lda #<rs_slow               ;   run the rs_z4 copy below with its four reads
+        jsr ?gpat                   ;   pointed at rs_slow, then point them back
+        jsr ?gz                     ;   (?gz ends in jmp fill_poly_int -> its rts lands here)
+        lda #<rs_z4
+?gpat   sta ?gz+1
+        sta ?gzh+1
+        sta ?gzv+1
+        sta ?gzy+1
+        rts
+?gz     jsr rs_z4                    ; bbw  (A = scaled_lo, the read_scaled contract)
+        sta bbw
+        lda g_scaled_hi
+        sta bbw+1
+?gzh    jsr rs_z4                    ; bbh
+        sta bbh
+        lda g_scaled_hi
+        sta bbh+1
+.if 1
+        m_pfetchx sfw23                    ; n verts
+sfr23
+.else
+        m_pfetch                    ; n verts
+.endif
+        sta nverts
+        lda bbw+1                   ; g_x0 = dr_x - bbw/2  (dr_x + ~half + 1)
+        lsr @
+        tax                         ; X = half hi ; C = bit 0 -> the lo ror
+        lda bbw
+        ror @
+        eor #$FF
+        sec
+        adc dr_x
+        sta g_x0
+        txa
+        eor #$FF
+        adc dr_x+1
+        sta g_x0+1
+        lda bbh+1                   ; g_y0 = dr_y - bbh/2
+        lsr @
+        tax
+        lda bbh
+        ror @
+        eor #$FF
+        sec
+        adc dr_y
+        sta g_y0
+        txa
+        eor #$FF
+        adc dr_y+1
+        sta g_y0+1
+        ldx #0                      ; X = vertex index, kept live across rs_z4
+?gzv    jsr rs_z4                    ; px = g_x0 + scaled
         clc
         adc g_x0
         sta pts_xlo,x
         lda g_x0+1
         adc g_scaled_hi
         sta pts_xhi,x
-        jsr read_scaled             ; py = g_y0 + scaled
+?gzy    jsr rs_z4                    ; py = g_y0 + scaled
         clc
         adc g_y0
         sta pts_ylo,x
@@ -848,8 +927,15 @@ fmlb_h2 sbc fmul_sq2h,x
         sta pts_yhi,x
         inx
         cpx nverts
-        bne ?vl
-        jmp fill_poly_int
+        bne ?gzv
+        jmp df_disp
+.if 1
+sfw23   jsr pf_wrap
+        jmp sfr23
+.endif
+        ert <rs_fast>=<rs_slow      ; the lo-byte order the entry test relies on
+        ert <rs_slow>=<rs_z4
+        ert [>rs_slow]<>[>rs_z4]    ; ?gpat patches the lo bytes only
 .endp
 .else
 .proc do_fill
@@ -963,11 +1049,14 @@ fmlb_h2 sbc fmul_sq2h,x
         bne ?gbk
         cpy #>draw_scanline_fast
         beq ?gnab                   ; fast dispatch = bbox fully on-screen, safe
-?gbk    lda cc_baking
+?gbk
+.ifdef CELLCACHE
+        lda cc_baking               ; (GAME only: the intro has no cell cache)
         beq ?gnab
         lda cc_flag
         ora #$80                    ; abort the bake -> NEVER
         sta cc_flag
+.endif
 ?gnab   ldx #0                      ; X = vertex index, kept LIVE across read_scaled
                                     ;   (fps wave: rs_fast/rs_z4/rs_slow all preserve
                                     ;   X now) -- the old pha/tay/ldx/pla shuffle and
@@ -997,10 +1086,24 @@ fmlb_h2 sbc fmul_sq2h,x
 
 ; do_hier : group node ; recurse over children.
 .if 1
+dh_c1w  jsr pf_wrap                 ; dh_c0's rare window wraps, out of line (before
+        jmp do_hier.dh_cx1          ;   the proc: the jmp above is the flow boundary)
+dh_c2w  jsr pf_wrap
+        jmp do_hier.dh_cx2
+dh_p1w  jsr pf_wrap
+        jmp do_hier.dh_pr1
+dh_p2w  jsr pf_wrap
+        jmp do_hier.dh_pr2
+dh_p3w  jsr pf_wrap
+        jmp do_hier.dh_pr3
+        nocross do_hier, do_hier.dh_nc0, do_hier.dh_nc
 .proc do_hier
-        jsr read_scaled             ; bx = dr_x - scaled  (A = scaled_lo:
-        eor #$FF                    ;   dr_x + ~scaled + 1, carry-identical to sbc)
-        sec
+        lda rs_smc+1                ; the zoom is the same for the whole tree: test it
+        cmp #<rs_fast               ;   ONCE here -- zoom 64 reads bx/by inline and sets
+        jeq ?hf                     ;   dh_sel = bit (the child reads inline); any other
+        jsr read_scaled             ;   zoom: read_scaled, dh_sel = jmp dh_cgen
+        eor #$FF                    ; bx = dr_x - scaled  (A = scaled_lo:
+        sec                         ;   dr_x + ~scaled + 1, carry-identical to sbc)
         adc dr_x
         sta bx
         lda dr_x+1
@@ -1014,39 +1117,51 @@ fmlb_h2 sbc fmul_sq2h,x
         lda dr_y+1
         sbc g_scaled_hi
         sta by+1
-        m_pfetch                    ; child count (inlined poly_fetch, fps wave)
-        sta hcount                  ; loop hcount+1 times
+        ldx #$4C                    ; jmp
+?hsel   stx dh_sel
+        m_pfetchx dh_p1w            ; child count (inlined poly_fetch, fps wave;
+dh_pr1  sta hcount                  ;   wrap stubs before the proc) loop hcount+1
 ?loop
-        m_pfetch                    ; word hi (big-endian)
-        sta word_hi
-        m_pfetch                    ; word lo
-        sta word_lo
+        m_pfetchx dh_p2w            ; word hi (big-endian)
+dh_pr2  sta word_hi
+        m_pfetchx dh_p3w            ; word lo
+dh_pr3  sta word_lo
         ; (skill pass 2026-09-09: the child position is composed STRAIGHT into dr_x/dr_y --
         ;  the old code stored it in cx/cy and copied it over below. Nothing between here
         ;  and the child draw reads dr_x/dr_y (read_scaled, m_pfetch, the pstk save all
         ;  use bx/by and the stream), and bx/by were derived from dr_x/dr_y already.)
-        jsr read_scaled             ; dr_x = cx = bx + scaled  (A = scaled_lo)
-        clc
+.if 1
+dh_sel  bit dh_cgen                  ; SMC opcode (set above): bit = zoom 64, the reads
+                                    ;   below inline; jmp = the generic path (out of line)
+dh_c0   lda (pb_ptr),y              ; dr_x = cx = bx + byte  (Y = 0)
+        inc pb_ptr
+        beq dh_c1w                  ; wrap out of line: the bne here was taken ~always
+dh_cx1  clc                         ;   AND crossed a page (+1) -> 2 cyc, not 4
         adc bx
         sta dr_x
         lda bx+1
-        adc g_scaled_hi
+        adc #0
         sta dr_x+1
-        jsr read_scaled             ; dr_y = cy = by + scaled
-        clc
+        lda (pb_ptr),y              ; dr_y = cy = by + byte
+        inc pb_ptr
+        beq dh_c2w
+dh_cx2  clc
         adc by
         sta dr_y
         lda by+1
-        adc g_scaled_hi
+        adc #0
         sta dr_y+1
-        lda #$FF
+.endif
+?cdone  lda #$FF
         sta ccol
         lda word_hi
         bpl ?nocol                  ; bit15 clear -> no per-child colour
+dh_nc0
         m_pfetch                    ; ccol = poly[dr_off] & 0x7F
         and #$7F
         sta ccol
         m_pfetch                    ; (python off += 2 : skip the 2nd byte)
+dh_nc
 ?nocol
         ; --- save _hier state, recurse, restore ---
         ; PERF (optimisation -- GAME FORK ONLY; the intro src/aw_polygon.asm still does the
@@ -1058,6 +1173,31 @@ fmlb_h2 sbc fmul_sq2h,x
         ;   get_dr_off round-trip here AND the LUT recompute on restore (~70 cyc/hier-child).
         ;   Output is unchanged (get_dr_off <-> set_poly_ptr are inverses; the saved pointer
         ;   IS what the recompute would reproduce). NOTE: get_dr_off is now UNUSED in this build.
+.if 1
+        ldx psp                     ; the 9-byte frame at pstk+psp, fixed offsets: one
+        lda poly_bnk                ;   psp += 9 instead of 9 x inx (depth < 28: X+8
+        sta pstk,x                  ;   stays below 256, as the inx walk did)
+        lda pb_ptr
+        sta pstk+1,x
+        lda pb_ptr+1
+        sta pstk+2,x
+        lda bx
+        sta pstk+3,x
+        lda bx+1
+        sta pstk+4,x
+        lda by
+        sta pstk+5,x
+        lda by+1
+        sta pstk+6,x
+        lda hcount
+        sta pstk+7,x
+        lda dr_col
+        sta pstk+8,x
+        txa
+        clc
+        adc #9
+        sta psp
+.else
         ldx psp
         lda poly_bnk
         sta pstk,x
@@ -1087,20 +1227,55 @@ fmlb_h2 sbc fmul_sq2h,x
         sta pstk,x
         inx
         stx psp
+.endif
         ; child draw params : dr_off = (word & 0x7FFF) * 2
         lda word_lo
         asl @
         sta dr_off
+        sta pb_ptr                  ; (set_poly_ptr inline: the window low byte)
         lda word_hi
         and #$7F
         rol @
         sta dr_off+1
+        tax                         ; set_poly_ptr, inline (6502 skill: a routine
+        lda poly_bank_lut,x         ;   this short is cheaper than its jsr/rts):
+        clc                         ;   dr_off jumped to the child -> sync the stream
+        adc poly_base_adj           ;   pointer and the MEMAC-B bank
+        sta poly_bnk
+        sta memb_cur
+        sta VBXE_MEMAC_B
+        lda poly_win_lut,x
+        sta pb_ptr+1
         lda ccol                    ; (dr_x/dr_y already hold cx/cy, see above)
         sta dr_col
-        jsr set_poly_ptr            ; dr_off jumped to the child -> sync stream ptr
         jsr poly_draw
         ldy #0                      ; the child's raster clobbered Y -> restore the
         ; restore                   ;   decoder's Y = 0 invariant for the fetches below
+.if 1
+        lda psp
+        sec
+        sbc #9
+        sta psp
+        tax
+        lda pstk+8,x
+        sta dr_col
+        lda pstk+7,x
+        sta hcount
+        lda pstk+6,x
+        sta by+1
+        lda pstk+5,x
+        sta by
+        lda pstk+4,x
+        sta bx+1
+        lda pstk+3,x
+        sta bx
+        lda pstk+2,x
+        sta pb_ptr+1
+        lda pstk+1,x
+        sta pb_ptr
+        lda pstk,x
+        sta poly_bnk                ; parent stream pointer restored directly (no LUT)
+.else
         ldx psp
         dex
         lda pstk,x
@@ -1130,6 +1305,7 @@ fmlb_h2 sbc fmul_sq2h,x
         lda pstk,x
         sta poly_bnk                ; parent stream pointer restored directly (no LUT)
         stx psp
+.endif
         ; PERF (part of the same optimisation): re-own the MEMAC-B window for the parent
         ; bank DIRECTLY (was set_poly_ptr's LUT path). memb_cur LEADS (the sound IRQ
         ; restores the register to memb_cur); write the register ONLY when the child left
@@ -1143,6 +1319,51 @@ fmlb_h2 sbc fmul_sq2h,x
         bmi ?hdone                  ; childcount+1 iterations
         jmp ?loop
 ?hdone  rts
+?hf     m_pfetchx sfw31             ; zoom 64: bx = dr_x - byte (hi 0)
+sfr31   eor #$FF
+        sec
+        adc dr_x
+        sta bx
+        lda dr_x+1
+        sbc #0
+        sta bx+1
+.if 1
+        m_pfetchx sfw19                    ; by = dr_y - byte
+sfr19
+.else
+        m_pfetch                    ; by = dr_y - byte
+.endif
+        eor #$FF
+        sec
+        adc dr_y
+        sta by
+        lda dr_y+1
+        sbc #0
+        sta by+1
+        ldx #$2C                    ; bit
+        jmp ?hsel
+.if 1
+sfw19   jsr pf_wrap
+        jmp sfr19
+sfw31   jsr pf_wrap
+        jmp sfr31
+.endif
+dh_cgen                             ; zoom != 64: the generic child read, out of line
+        jsr read_scaled             ; dr_x = cx = bx + scaled  (A = scaled_lo)
+        clc
+        adc bx
+        sta dr_x
+        lda bx+1
+        adc g_scaled_hi
+        sta dr_x+1
+        jsr read_scaled             ; dr_y = cy = by + scaled
+        clc
+        adc by
+        sta dr_y
+        lda by+1
+        adc g_scaled_hi
+        sta dr_y+1
+        jmp ?cdone
 .endp
 .else
 .proc do_hier

@@ -71,15 +71,13 @@ PMSDMA  = $D290                      ; w: SAMDMA -- sample DMA writes the same
 ; --- IRQ-hot state in ZERO PAGE. $AB/$AD/$B4 are free in the GAME build: the
 ; intro symbols that own them (pl_bnk / poly_hi / txt_ptr+1) are not referenced
 ; by the game fork (game uses pl_bank=$B3, gtxt_ptr=$C0).
-snd_active = $AB                     ; MERGED state: 0 = off ; 1 = phase 0 next
-                                     ;   (fetch byte, hi nibble) ; 2 = phase 1
-                                     ;   next (lo nibble + advance). diskio still
-                                     ;   writes 0 here to silence before a load.
+; (the player's state is the low byte of snd_irq's `body jmp`: ph0 / sph1 / soff --
+;  snd_init, snd_play, the IRQ and diskio's pre-load silence write it; $AB is free)
 zsnd_cur   = $AD                     ; current sample byte (lo nibble for phase 1)
 zsnd_bank  = $B4                     ; current MEMAC-B bank (= snd_blist[snd_blidx])
 
 snd_blidx     dta 0                  ; index into snd_blist
-snd_rem       dta a(0)               ; (2) NEGATED bytes remaining (-len): the IRQ
+snd_rem = $E7                        ; (2, zp) NEGATED bytes remaining (-len): the IRQ
                                      ;   counts UP (`inc` = 9 cyc common case);
                                      ;   $0000 = sample done
 snd_xsave     dta 0                  ; X save for the rare bank-advance path
@@ -122,8 +120,8 @@ snd_init
         sta AUDC4                    ;   must start silent
         lda #15
         sta AUDF1
-        lda #0
-        sta snd_active
+        lda #<snd_irq.soff
+        sta snd_irq.body+1           ; the player's state: off
         jsr snd_mode_init            ; the intro menu's answer -> POKEY or a covox
                                      ;   base; $FF (no menu) -> the $D280 probe
         sei
@@ -159,8 +157,8 @@ snd_play
         lda snd_blist,y                ; bank = snd_blist[blidx]
         sta zsnd_bank
         sei
-        lda #1
-        sta snd_active                 ; state 1 = phase 0 next
+        lda #<snd_irq.ph0
+        sta snd_irq.body+1             ; phase 0 next (the IRQ's state = its jump)
         lda POKMSK
         ora #$01
         sta POKMSK
@@ -198,10 +196,14 @@ snd_play
         lda POKMSK
         sta IRQEN
 .endif
-body    lda snd_active               ; cv_irq jumps in here (shared from now on)
-        beq ?off                     ; 0 = stray after silence -> mute + disable
-        cmp #2
-        beq ?lo
+body    jmp ph0                      ; 6502 skill (patch an operand to switch behaviour):
+                                     ;   the state IS this jump's low byte -- ph0 /
+                                     ;   sph1 / soff -- 3 cycles instead of `bit / bvs /
+                                     ;   bpl`'s 6-7. cv_irq jumps through it (jmp ()).
+        ert [>ph0]<>[>sph1]          ; one page: only the low byte is ever written
+        ert [>ph0]<>[>soff]
+        ert [<[body+1]]=$FF          ; (jmp (body+1) must not straddle a page)
+ph0
         ; --- state 1 / phase 0 : read the VRAM byte, output the HI nibble ---
         lda zsnd_bank
         sta VBXE_MEMAC_B
@@ -215,19 +217,19 @@ cp0     lsr @                        ; hi nibble -> AUDC4 ASAP (shift in A: the
         sta AUDC4                    ;   job as `and #$F0 / sta cv_next` -- A still
                                      ;   holds the RAW byte here, so its top nibble
                                      ;   IS the 0..240 sample, no shifting needed
-        lda memb_cur                 ; restore the poly/playlist bank
+cp0e    lda memb_cur                 ; restore the poly/playlist bank
         sta VBXE_MEMAC_B
-        lda #2
-        sta snd_active               ; state 2 = phase 1 next
+        lda #<sph1
+        sta body+1                   ; phase 1 next
         pla
         rti
-?lo     ; --- state 2 / phase 1 : output the LO nibble, count, advance ---
+sph1    ; --- state 2 / phase 1 : output the LO nibble, count, advance ---
         lda zsnd_cur
 cp1     and #$0F                     ; 7-byte SMC slot (cv_p1): covox uses `asl @ x4`
         ora #$10                     ;   instead, which shifts the LO nibble up to
         sta AUDC4                    ;   0..240 and drops the high one in one go
-        lda #1
-        sta snd_active               ; state 1 = phase 0 next
+        lda #<ph0
+        sta body+1                   ; phase 0 next
         inc snd_rem                  ; rem++ toward $0000 (stored negated)
         bne ?adv                     ; common case: 9 cyc total
         inc snd_rem+1
@@ -254,18 +256,17 @@ cp1     and #$0F                     ; 7-byte SMC slot (cv_p1): covox uses `asl 
         ; ?stop and ?off used to be two copies of the same teardown; merging them
         ; paid for the wider silence slot below (net -7 bytes, and $2000-$3FFF has
         ; ~77 to spare).
-?stop   lda #0
-        sta snd_active               ; fall through
-?off
+?stop   lda #<soff
+        sta body+1                   ; off (a stray IRQ lands on soff again); fall through
+soff
 cvm     lda #$00                     ; 11-byte SMC slot (cv_off): POKEY just silences
         sta AUDC4                    ;   AUDC4, covox parks BOTH ports and the pending
-        nop                          ;   byte at $80 = mid rail, so a re-armed timer
-        nop                          ;   cannot push a stale sample on tick 1 and the
-        nop                          ;   DAC does not sit on a DC step
-        nop
-        nop
-        nop
-        lda POKMSK
+        jmp cvme                     ;   byte at $80 = mid rail, so a re-armed timer
+        dta 0,0,0                    ;   cannot push a stale sample on tick 1 and the
+                                     ;   DAC does not sit on a DC step. (The slot's
+                                     ;   rest is jumped over, not nop'ed through.)
+cvme    lda POKMSK
+        ert cvme-cvm<>11             ; the covox image (cv_off) fills exactly this
         and #$FE
         sta POKMSK
         sta IRQEN
@@ -483,11 +484,9 @@ cvpatch dta a(snd_irq.cp0),  9, a(cv_p0)   ; phase 0 output slot
 ; and both variants stay readable side by side.
 ;-----------------------------------------------------------------------------
 cv_p0   and #$F0                     ; A still holds the RAW byte: its top nibble
-        sta cv_next                  ;   IS the sample, 0..240. 4 bytes of padding
-        nop                          ;   to fill POKEY's `lsr @ x4 / ora / sta` --
-        nop                          ;   and the same 14 cycles, so phase 0 does
-        nop                          ;   not even get slower.
-        nop
+        sta cv_next                  ;   IS the sample, 0..240. The slot's last 4
+        jmp snd_irq.cp0e             ;   bytes are jumped over (3 cycles), not
+        dta 0                        ;   nop'ed through (8)
 cv_p0_end
 cv_p1   asl @                        ; A = the raw byte again: 4 shifts push the LO
         asl @                        ;   nibble to 0..240 and drop the high one, so
@@ -539,7 +538,7 @@ cv_irqh dta >cv_irq
         lda cv_next
 cvw0    sta COVOXL                   ; SMC oper : base+0 / base+1 of whichever
 cvw1    sta COVOXR                   ;   card the intro's menu picked (cv_set_base)
-        jmp snd_irq.body
+        jmp (snd_irq.body+1)         ; straight to the phase (5 vs jmp + jmp 6)
 .endp
 
 ;-----------------------------------------------------------------------------
@@ -557,9 +556,10 @@ cvw1    sta COVOXR                   ;   card the intro's menu picked (cv_set_ba
         bcc ?ok
 ?auto   lda #$FF
 ?ok     sta snd_mode
-        lda snd_mode                 ; RETURN WITH THE FLAGS AN `lda` LEAVES: the
-        rts                          ;   caller branches on them, and `cmp #5` above
-                                     ;   leaves N set for a perfectly good mode 0
+        ora #0                       ; RETURN WITH THE FLAGS AN `lda` LEAVES (N/Z of A,
+        rts                          ;   A kept): the caller branches on them, and
+                                     ;   `cmp #5` above leaves N set for a perfectly
+                                     ;   good mode 0
 .endp
 
 ;-----------------------------------------------------------------------------
@@ -578,7 +578,8 @@ cvw1    sta COVOXR                   ;   card the intro's menu picked (cv_set_ba
         jsr cv_set_base
         jmp snd_go_covox
 .else
-        jmp snd_apply                ; -> 8-bit covox output if one answers
+        ;jmp snd_apply                ; -> 8-bit covox output if one answers
+        ert *<>snd_apply             ; falls through into snd_apply
 .endif
 .endp
 

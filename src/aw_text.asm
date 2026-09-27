@@ -27,6 +27,7 @@ t_vis   equ t_i0                    ; current line: 1 = txt_y < 200 (line on scr
 op_drawtext
         jsr pl_byte
         sta t_sidlo                  ; strId lo  (NB: pl_byte clobbers tmp_lo)
+        sta ?cl+1                    ;   ... and the scan's `cmp #` immediate (SMC)
         jsr pl_byte
         sta t_sidhi                  ; strId hi
         jsr pl_byte
@@ -35,19 +36,20 @@ op_drawtext
         sta txt_y
         jsr pl_byte
         sta txt_col
-        ; find table index for strId (linear scan; aw_nstr entries)
-        ldx #0
-?scan   cpx #aw_nstr
-        bcc ?chk
+        ; find table index for strId: a linear scan counting DOWN (6502 skills: `dex /
+        ; bne`, the id low byte as a `cmp #` immediate) -- the ids are unique (sorted,
+        ; aw_text_data.inc), so the match is the one the old upward scan found
+        ldx #aw_nstr
+?chk    lda aw_id_lo-1,x
+?cl     cmp #0
+        beq ?hi
+?nx     dex
+        bne ?chk
         jmp ?done                    ; not found -> skip the string
-?chk    lda aw_id_lo,x
-        cmp t_sidlo
-        bne ?nx
-        lda aw_id_hi,x
+?hi     lda aw_id_hi-1,x
         cmp t_sidhi
-        beq ?found
-?nx     inx
-        bne ?scan
+        bne ?nx
+        dex                          ; X = the 0-based index
 ?found  lda aw_str_lo,x              ; txt_ptr = aw_strbytes + offset[x]
         clc
         adc #<aw_strbytes
@@ -83,8 +85,8 @@ op_drawtext
         sta t_cx
 ?char   ldy #0
         lda (txt_ptr),y
-        bne ?notend
-        jmp ?done                    ; 0x00 terminator
+        beq ?done
+        ;jmp ?done                    ; 0x00 terminator
 ?notend inc txt_ptr                  ; ptr++ (16-bit)
         bne ?p1
         inc txt_ptr+1
@@ -143,9 +145,16 @@ op_drawtext
 ;   waiting; the next BCB edit (here or in fill_span) is gated by its own
 ;   leading idle, like the polygon spans.
 .proc draw_glyph
+.if 1
+        ; vbxe-blitter skill: the blitter reads a BCB only at START (Altirra vbxe.cpp
+        ; LoadBlitter), so the fields go in while the previous glyph may still run --
+        ; only the START waits, hardened (two reads).
+        lda t_ch                     ; src = FONT_V + (ch-$20)*32
+.else
 ?bw     lda VBXE_BL_BUSY             ; inlined blit_idle: BCB edits below
         bne ?bw
         lda t_ch                     ; src = FONT_V + (ch-$20)*32
+.endif
         sec
         sbc #$20
         tax
@@ -170,7 +179,12 @@ op_drawtext
         sta BCB+BCB_DST_ADDR+1
         lda t_gh
         sta BCB+BCB_HEIGHT
-        lda #1                       ; fire, no wait (gated by the next leading idle)
+.if 1
+?bw     lda VBXE_BL_BUSY             ; hardened wait, right before the START
+        ora VBXE_BL_BUSY
+        bne ?bw
+.endif
+        lda #1
         sta VBXE_BL_START
         rts
 .endp
@@ -207,8 +221,8 @@ m32tab  dta 0,32,64,96,128,160,192,224
         bcc ?wr
         lda #$FF
 ?wr     sta (txt_ptr),y
-        iny
-        cpy #4
+        iny                          ; skill-ok LOOPCP: the 4 output bytes follow the
+        cpy #4                       ;   bit pairs shifted out of t_rbits, in order
         bne ?pair
         lda txt_ptr                  ; dst += 4
         clc

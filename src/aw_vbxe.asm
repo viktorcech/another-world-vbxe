@@ -9,7 +9,7 @@
 ;   NOTE: the ATR boot loader (src_game/bootloader.asm vbxe_check) carries its own
 ;   copy of the $D600 half of this test so a VBXE-less machine fails ~1 s after
 ;   power-on instead of after the whole intro load. Change the criteria HERE and
-;   THERE together -- tools/make_full_atr.py compares the emitted constants in
+;   THERE together -- tools/buildstep_join_disk.py compares the emitted constants in
 ;   boot.bin vs awintro.xex/awgame.xex and fails the build if they drift.
 ;   Returns:  C=0          -> VBXE at $D600, OK to run
 ;             C=1, A=$01   -> VBXE present but at $D700 (unsupported base)
@@ -32,7 +32,7 @@
         cmp #MINOR_V120
         bcc ?none
         lda #$01                     ; present at $D700 -> unsupported base
-        sec
+        ;sec
         rts
 ?none   lda #$00                     ; nothing at either base
         sec
@@ -73,8 +73,12 @@
         lda #0                      ; 65C816 (Rapidus) -> full detail
         beq ?set                    ; (A = 0 -> always taken)
 ?stock  lda #1                      ; stock 6502 -> half vertical res
+.if 1
+?set    jmp pbh_set                 ; the cell + its SMC operand copies (tail call)
+.else
 ?set    sta poly_bcb_h
         rts
+.endif
 .endp
 
 .proc setup_memac
@@ -87,6 +91,34 @@
         rts
 .endp
 
+.if 1
+.proc setup_xdls
+        lda #0
+        sta VBXE_VCTL
+        ldx #3                      ; pages 3..0 (order is irrelevant: count down)
+?pg     txa                         ; X*$40 for X = 0..3: two bits rotated to the top
+        lsr @                       ;   (lsr / ror / ror = 6 cyc, was 6 x asl = 12)
+        ror @
+        ror @                       ; C = 0 again (bit 1 of X went into bit 7)
+        adc #<MEMW
+        sta dptr
+        lda #>MEMW
+        sta dptr+1                  ; (<MEMW + X*$40 never carries: MEMW is page-aligned)
+        ert <MEMW>$3F
+        ldy #xdl_tmpl_len-1
+?cp     lda xdl_tmpl,y
+        sta (dptr),y
+        dey
+        bpl ?cp
+        ldy #8                      ; OVADR hi byte = page index (offset 8 in xdl_tmpl)
+        txa
+        sta (dptr),y
+        dex
+        bpl ?pg
+        lda #0
+        jmp show_page
+.endp
+.else
 .proc setup_xdls
         lda #0
         sta VBXE_VCTL
@@ -116,9 +148,10 @@
         cpx #4
         bne ?pg
         lda #0
-        jsr show_page
-        rts
+        jmp show_page
+        ;rts
 .endp
+.endif
 
 xdl_tmpl
         ; top overscan: 20 lines, overlay OFF -> the border shows COLBK (black).
@@ -138,6 +171,19 @@ xdl_tmpl
         dta PRI_ALL
 xdl_tmpl_len equ *-xdl_tmpl
 
+.if 1
+.proc show_page                     ; A = page 0..3 (vm_page / cur2 never exceed 3)
+        lsr @                       ; A*$40: the two page bits rotated to the top --
+        ror @                       ;   6 cyc instead of 6 x asl (12)
+        ror @
+        sta VBXE_XDLA0
+        lda #$00
+        sta VBXE_XDLA1
+        lda #[CTRL>>16]
+        sta VBXE_XDLA2
+        rts
+.endp
+.else
 .proc show_page
         asl @
         asl @
@@ -152,6 +198,7 @@ xdl_tmpl_len equ *-xdl_tmpl
         sta VBXE_XDLA2
         rts
 .endp
+.endif
 
 .ifdef HIRES_CAP
 ; set_render_mode : A = 0 -> LR 160 ; A != 0 -> SR 320. Stores `hires` and patches the
@@ -159,6 +206,96 @@ xdl_tmpl_len equ *-xdl_tmpl
 ;   MEMW + page*$40, MEMAC-A control bank permanently mapped at $8000). A 320-wide page
 ;   (64000 B) still fits its own 64K VRAM region, so only width+pxmode change, not OVADR.
 ;   Used so the access-code part (16008) shows readable 320 letters; gameplay stays LR.
+.if 1
+; (skill pass 2026-09-22: ONE straight path for both modes -- the per-mode bytes come
+;  from 2-entry tables indexed by the mode, the 4 XDLs are written at their constant
+;  offsets (no loop, no X*$40), and the page clear / copy BCB templates get the same
+;  width + stride. Same bytes land in the same places as the two old loops.)
+.proc set_render_mode
+        sta hires
+        cmp #1                      ; C = SR (A != 0)
+        lda #0
+        rol @
+        tax                         ; X = mode index (0 LR, 1 SR)
+        beq ?lr
+        lda #0                      ; SR (access-code 16008): force FULL vertical detail
+        beq ?det                    ;   (= Rapidus) even on stock 6502 -> readable letters
+?lr     lda cpu_detail              ; LR parts: restore CPU-detected vertical detail
+.if 1
+?det    jsr pbh_set                 ; the cell + its SMC operand copies
+.else
+?det    sta poly_bcb_h
+.endif
+        lda ?pxm,x                  ; XDL pixel mode (+4 in each XDL)
+        sta MEMW+XDL0_OFF+$04
+        sta MEMW+XDL0_OFF+$44
+        sta MEMW+XDL0_OFF+$84
+        sta MEMW+XDL0_OFF+$C4
+        lda ?wlo,x                  ; line width (+9/+10) = the page clear / copy stride
+        sta MEMW+XDL0_OFF+$09
+        sta MEMW+XDL0_OFF+$49
+        sta MEMW+XDL0_OFF+$89
+        sta MEMW+XDL0_OFF+$C9
+        sta BCBP+BCB_DST_STEPY
+        sta BCBK+BCB_SRC_STEPY
+        sta BCBK+BCB_DST_STEPY
+        lda ?whi,x
+        sta MEMW+XDL0_OFF+$0A
+        sta MEMW+XDL0_OFF+$4A
+        sta MEMW+XDL0_OFF+$8A
+        sta MEMW+XDL0_OFF+$CA
+        sta BCBP+BCB_DST_STEPY+1
+        sta BCBK+BCB_SRC_STEPY+1
+        sta BCBK+BCB_DST_STEPY+1
+        lda ?w1lo,x                 ; blit width-1
+        sta BCBP+BCB_WIDTH
+        sta BCBK+BCB_WIDTH
+        lda ?w1hi,x
+        sta BCBP+BCB_WIDTH+1
+        sta BCBK+BCB_WIDTH+1
+        lda ?fslo,x                 ; the span dispatch: fill_span (LR) / fill_span_sr
+        sta emit_span.cc_fsp+1
+        sta draw_dots.cc_dds+1
+        lda ?fshi,x
+        sta emit_span.cc_fsp+2
+        sta draw_dots.cc_dds+2
+        lda ?eslo,x                 ; clipped spans: straight to the LR body / generic
+        sta draw_scanline.dsl_rdy+1
+        lda ?eshi,x
+        sta draw_scanline.dsl_rdy+2
+        lda ?fb0,x                  ; draw_scanline_fast is LR-only: in SR its first 3
+        sta draw_scanline_fast      ;   bytes become `jmp dsf_sr`, LR puts
+        lda ?fb1,x                  ;   `lda hy_lo / sta` back
+        sta draw_scanline_fast+1
+        lda ?fb2,x
+        sta draw_scanline_fast+2
+        lda #0                      ; LR spans never write slen_hi: it must be 0 here
+        sta slen_hi
+        lda #$FF                    ; the span BCB's WIDTH+1 may hold an SR width:
+        sta last_scol               ;   the next span re-patches it with its mode
+        sta bcb_pg                  ; (the span BCB page / height shadow too)
+        rts
+?fb0    dta $A6, $4C                ; ldx zp  / jmp abs
+?fb1    dta hy_lo, <dsf_sr
+?fb2    dta DSF_B2, >dsf_sr          ; the fused LR span's 3rd byte (aw_raster) / hi
+        ert hy_lo>$FF
+        ert sy>$FF
+?fslo   dta <fill_span, <fill_span_sr
+?fshi   dta >fill_span, >fill_span_sr
+.if 1
+?eslo   dta <draw_scanline_fast.es_lrf, <dsf_sr.es_srf  ; the fused clipped spans
+?eshi   dta >draw_scanline_fast.es_lrf, >dsf_sr.es_srf
+.else
+?eslo   dta <emit_span.es_lr, <emit_span
+?eshi   dta >emit_span.es_lr, >emit_span
+.endif
+?pxm    dta LR_PXMODE, SR_PXMODE
+?wlo    dta <SCRW, <HR_SR_W
+?whi    dta >SCRW, >HR_SR_W
+?w1lo   dta <(SCRW-1), <(HR_SR_W-1)
+?w1hi   dta >(SCRW-1), >(HR_SR_W-1)
+.endp
+.else
 .proc set_render_mode
         sta hires
         bne ?sr
@@ -206,7 +343,20 @@ xdl_tmpl_len equ *-xdl_tmpl
         rts
 .endp
 .endif
+.endif
 
+.if 1
+.proc upload_bcb                    ; span BCB + the page clear / copy templates
+        ldx #3*BCB_SIZE-1           ;   (contiguous: $100, BCBP_OFF, BCBK_OFF)
+?f      lda bcb_tmpl,x
+        sta BCB,x
+        dex
+        bpl ?f
+        rts
+.endp
+        ert BCBP_OFF<>BCBF_OFF+BCB_SIZE
+        ert BCBK_OFF<>BCBP_OFF+BCB_SIZE
+.else
 .proc upload_bcb
         ldx #BCB_SIZE-1
 ?f      lda bcb_tmpl,x
@@ -215,6 +365,7 @@ xdl_tmpl_len equ *-xdl_tmpl
         bpl ?f
         rts
 .endp
+.endif
 
 bcb_tmpl
         dta $00,$00,$00             ; 0  src addr
@@ -231,6 +382,15 @@ bcb_tmpl
         dta $00                    ; 18 zoom
         dta $00                    ; 19 pattern
         dta BLT_COPY               ; 20 control    (PATCHED)
+.if 1
+; BCBP : page clear -- a constant fill (AND 0): per call only DST+2 = page, XOR = colour
+        dta $00,$00,$00, a(0), $00, $00,$00,$00, a(SCRW), $01, a(SCRW-1), SCRH-1
+        dta $00, $00, $00,$00,$00, BLT_COPY
+; BCBK : page copy -- per call only SRC+2 / DST+2 = the pages
+        dta $00,$00,$00, a(SCRW), $01, $00,$00,$00, a(SCRW), $01, a(SCRW-1), SCRH-1
+        dta $FF, $00, $00,$00,$00, BLT_COPY
+        ert *-bcb_tmpl<>3*BCB_SIZE
+.endif
 
 ;=============================================================================
 ; Palette
@@ -259,6 +419,39 @@ bcb_tmpl
 .endp
 
 ; set_palette(A = palette index 0..31) : load 16 RGB triples into VBXE pal #1.
+.if 1
+; (skill pass 2026-09-22: N*48 = (3N)<<4 composed in A -- 3N <= 93 fits a byte, its
+;  <<4 low byte and >>4 high byte are two shift runs in A -- instead of the 16-bit
+;  asl/rol loop in memory: ~46 cyc, was ~150. Same pointer.)
+.proc set_palette
+        sta t_lo                    ; N (0..31)
+        asl @                       ; 2N, C = 0 (N < 128)
+        adc t_lo                    ; 3N (<= 93), C = 0
+        tax
+        lsr @
+        lsr @
+        lsr @
+        lsr @
+        sta pal_ptr+1               ; hi(N*48) = 3N >> 4
+        txa
+        asl @
+        asl @
+        asl @
+        asl @                       ; lo(N*48) = (3N << 4) & $FF
+        clc
+        adc #<pal_data
+        sta pal_ptr
+        lda pal_ptr+1
+        adc #>pal_data
+        sta pal_ptr+1
+        lda #1
+        sta VBXE_PSEL
+        ; intro_pal.bin holds 7-bit channels; VBXE colour registers are 8-bit,
+        ; so shift left 1 (== aw_play's d<<1 / the aw_sim oracle value).
+        ldy #0
+        sty VBXE_CSEL
+        ldx #16
+.else
 .proc set_palette
         sta zp_n
         lda zp_n
@@ -292,12 +485,13 @@ bcb_tmpl
         sta pal_ptr+1
         lda #1
         sta VBXE_PSEL
-        lda #0
-        sta VBXE_CSEL
+        ;lda #0
+        stx VBXE_CSEL
         ; intro_pal.bin holds 7-bit channels; VBXE colour registers are 8-bit,
         ; so shift left 1 (== aw_play's d<<1 / the aw_sim oracle value).
         ldy #0
         ldx #16
+.endif
 ?col    lda (pal_ptr),y
         asl @
         sta VBXE_CR
@@ -327,6 +521,46 @@ bcb_tmpl
         rts
 .endp
 
+.if 1
+; clear_page / copy_page (vbxe-blitter skill: a pre-filled template per slot): the page
+;   BCBs BCBP / BCBK hold every constant field (set_render_mode patches the LR/SR width +
+;   stride), a call writes only the page byte(s) and the colour. The span BCB is not
+;   touched, so the next span keeps its mode fields (no last_scol re-patch). BL_ADR0
+;   picks the slot for this START only; the blitter latched it, so it goes straight
+;   back to the span BCB.
+.proc clear_page                    ; A = page, X = colour
+        sta BCBP+BCB_DST_ADDR+2     ; (the slot's fields go in at once, even while its
+        stx BCBP+BCB_XOR            ;   previous blit runs: only the START waits)
+        lda #<[CTRL+BCBP_OFF]
+        jmp fire_slot               ; (a jmp: the branch would be taken every time, and
+.endp                               ;   across a page that costs 4)
+        ert <[CTRL+BCBP_OFF]=0
+
+.proc copy_page                     ; cp_src -> cp_dst (full page)
+        lda cp_src
+        sta BCBK+BCB_SRC_ADDR+2
+        lda cp_dst
+        sta BCBK+BCB_DST_ADDR+2
+        lda #<[CTRL+BCBK_OFF]
+.endp
+        ert <[CTRL+BCBK_OFF]=0
+        ert *<>fire_slot            ; copy_page falls through into fire_slot
+; fire_slot : START the list at BL_ADR0 = A (same $0401xx page), then point BL_ADR back
+;   at the span BCB. BL_ADR is only a register until a START latches it (Altirra
+;   vbxe.cpp: BL_ADR0 -> mBlitListAddr; a running list fetches from its own pointer),
+;   so it goes in before the (hardened) wait.
+.proc fire_slot
+        sta VBXE_BL_ADR0
+?w      lda VBXE_BL_BUSY
+        ora VBXE_BL_BUSY
+        bne ?w
+        lda #1
+        sta VBXE_BL_START
+        lda #<BCBF_V
+        sta VBXE_BL_ADR0
+        rts
+.endp
+.else
 .proc clear_page                    ; A = page, X = colour
         pha
         jsr blit_idle               ; idle before editing the BCB (X=colour kept)
@@ -371,8 +605,8 @@ bcb_tmpl
         sta BCB+BCB_CTRL
         lda #$FF                     ; this clobbered the span BCB's mode fields
         sta last_scol                ;   -> force fill_span to re-patch its mode
-        jsr fire_fill
-        rts
+        jmp fire_fill
+        ;rts
 .endp
 
 .proc copy_page                     ; cp_src -> cp_dst (full page)
@@ -438,102 +672,113 @@ bcb_tmpl
         sta BCB+BCB_CTRL
         lda #$FF                     ; copy clobbered the span BCB mode fields
         sta last_scol
-        jsr fire_fill
-        rts
+        jmp fire_fill
+        ;rts
 .endp
+
+.endif
 
 ; fill_span : one horizontal run on the current draw page.
 ;   scol < $10  : solid colour
 ;   scol = $10  : transparent (dest |= 8)  via BLT_OR
 ;   scol > $10  : copy the same pixels from page 0 (background shows through)
 .if 1
+        nocross fill_span, fill_span.fs_mode+5, fill_span.fs_send
 .proc fill_span
-        ; --- address + width math FIRST : touches only registers, so it runs
-        ;     CONCURRENTLY with the still-running previous blit (pipelining). ---
-        ; skill pass 2026-09-09 ("no sta tmp / lda tmp round-trip"): the offset is
-        ; composed into Y (lo) / X (hi) and written to the BCB straight from the
-        ; registers after the busy wait -- the zp_dlo/zp_dmid store + reload (and the
-        ; second reload in copy mode) are gone: -8 cyc per span. The busy loop only
-        ; touches A. Nothing else read zp_dlo/zp_dmid.
-        ldx sy                      ; offset = row_lut[sy] + sx
-.ifdef HIRES_CAP
-        ldy hires
-        beq ?lrlut
-        lda row_lo2,x               ; SR : y*320-$8000 LUT
+        ; skill pass 2026-09-22 (cycles per span, the most frequent call in a frame):
+        ;  * LR and SR are separate entries (set_render_mode points the callers at
+        ;    fill_span_sr in SR): the LR span does not test `hires`;
+        ;  * LR spans are < 256 wide: WIDTH+1 is written only with the mode fields;
+        ;  * the mode fields (AND/XOR/CTRL) only when scol changes; copy mode writes its
+        ;    constants when entering the mode (last_scol = $11), per span just the source;
+        ;  * fire early, wait late: the blitter reads a BCB only at START (Altirra
+        ;    vbxe.cpp LoadBlitter), so the fields go in while the previous span may still
+        ;    run -- only the START waits, hardened (a chained cell blit may be running).
+        ldx sy                      ; offset = row_lut[sy] + sx -> Y (lo) / X (mid),
+        lda row_lo,x                ;   kept for the copy mode's source
         clc
         adc sx_lo
         tay
-        lda row_hi2,x
-        adc sx_hi
-        tax
-        jmp ?lutok
-?lrlut
-.endif
-        lda row_lo,x
-        clc
-        adc sx_lo
-        tay                         ; Y = offset lo
+        sty BCB+BCB_DST_ADDR
         lda row_hi,x
         adc sx_hi
-        tax                         ; X = offset mid
-.ifdef HIRES_CAP
-?lutok
-.endif
-        ; --- ONLY NOW wait for the blitter, then edit the BCB ---
-?bw     lda VBXE_BL_BUSY            ; inlined blit_idle (saves the jsr/rts) --
-        bne ?bw                     ;   the BCB must be idle before editing
-        ; dst low/mid = offset (cbase low/mid are 0).  DST_ADDR+2 (page) and HEIGHT
-        ; are set ONCE per shape in op_drawpoly -- constant for every span -- so
-        ; they are NOT rewritten here.
-        sty BCB+BCB_DST_ADDR
+        tax
         stx BCB+BCB_DST_ADDR+1
         lda slen_lo                 ; emit_span already delivers WIDTH-1
         sta BCB+BCB_WIDTH
-        lda slen_hi
-        sta BCB+BCB_WIDTH+1
-        ; --- colour mode (cache: AND/XOR/CTRL only change when scol changes) ---
+fs_mode ; --- colour mode (cache: AND/XOR/CTRL only change when scol changes) ---
         lda scol
         cmp #$11
-        bcs ?copy                   ; copy mode: src changes per span -> always patch
+        bcs fs_copy                 ; copy mode: the source changes per span
         cmp last_scol
-        beq ?fire                   ; same solid/transparent colour -> BCB mode is set
-        sta last_scol
-        cmp #$10
-        beq ?transp
-        jmp ?solid
-?copy   ; copy from page 0 : src = offset (page 0 base = 0) -- patched every span
-        sty BCB+BCB_SRC_ADDR        ; (Y/X still = the offset, see above)
+        bne fs_setm                 ; a new solid/transparent colour: out of line
+fs_fire lda VBXE_BL_BUSY            ; hardened wait right before the START (two reads:
+        ora VBXE_BL_BUSY            ;   BUSY may read 0 for an instant between chained
+        bne fs_fire                 ;   BCBs)
+        lda #1
+        sta VBXE_BL_START
+        rts
+fs_copy sty BCB+BCB_SRC_ADDR        ; copy from page 0 : src = the same offset
         stx BCB+BCB_SRC_ADDR+1
+        lda last_scol
+        cmp #$11
+        beq fs_fire                 ; the copy constants are in the BCB already
+fs_cend
+        lda #$11                    ; mark mode=copy so a later solid/transp re-patches
+        sta last_scol
+        lda slen_hi
+        sta BCB+BCB_WIDTH+1
         lda #0
         sta BCB+BCB_SRC_ADDR+2
+        sta BCB+BCB_XOR
         lda #1
         sta BCB+BCB_SRC_STEPX
         lda #$FF
         sta BCB+BCB_AND
-        lda #0
-        sta BCB+BCB_XOR
         lda #BLT_COPY
         sta BCB+BCB_CTRL
-        lda #$11                    ; mark mode=copy so a later solid/transp re-patches
-        sta last_scol
-        jmp ?fire
-?transp lda #0
-        sta BCB+BCB_AND
-        lda #$08
+        beq fs_fire                 ; (BLT_COPY = 0)
+fs_setm sta last_scol               ; a new solid / transparent colour
+        ldy slen_hi                 ; (Y is free here) WIDTH+1 with the mode fields
+        sty BCB+BCB_WIDTH+1
+        ldy #0
+        sty BCB+BCB_AND
+        cmp #$10
+        beq ?transp
+        sta BCB+BCB_XOR             ; solid : A = scol
+        lda #BLT_COPY
+        sta BCB+BCB_CTRL
+        beq fs_fire                 ; (BLT_COPY = 0)
+?transp lda #$08
         sta BCB+BCB_XOR
         lda #BLT_OR
         sta BCB+BCB_CTRL
-        jmp ?fire
-?solid  lda #0
-        sta BCB+BCB_AND
-        lda scol
-        sta BCB+BCB_XOR
-        lda #BLT_COPY
-        sta BCB+BCB_CTRL
-?fire   lda #1                      ; inlined fire_fill (start, NO wait -- the next
-        sta VBXE_BL_START           ;   BCB edit is gated by its own leading idle)
-        rts
+        bne fs_fire                 ; (BLT_OR <> 0)
+fs_send                             ; (the nocross region ends here)
+        ert BLT_OR=0
+        ert BLT_COPY<>0
 .endp
+.ifdef HIRES_CAP
+; fill_span_sr : the SR (320) entry -- y*320 LUT, and WIDTH+1 per span (SR spans reach
+;   320). Joins fill_span's mode code. Only set_render_mode points callers here.
+.proc fill_span_sr
+        ldx sy
+        lda row_lo2,x               ; SR : y*320-$8000 LUT
+        clc
+        adc sx_lo
+        tay
+        sty BCB+BCB_DST_ADDR        ; (fields go in at once: only the START waits)
+        lda row_hi2,x
+        adc sx_hi
+        tax
+        stx BCB+BCB_DST_ADDR+1
+        lda slen_lo
+        sta BCB+BCB_WIDTH
+        lda slen_hi
+        sta BCB+BCB_WIDTH+1
+        jmp fill_span.fs_mode
+.endp
+.endif
 .else
 .proc fill_span
         ; --- address + width math FIRST : touches only ZP scratch, so it runs
@@ -628,21 +873,87 @@ bcb_tmpl
 ;   runs CONCURRENTLY while the CPU walks the next span's edges; the next BCB edit
 ;   is gated by that routine's own leading blit_idle, so the BCB is never touched
 ;   mid-blit (the dropped-polygon hazard stays covered). show_page is gated too.
+.if 1
+; fire_fill (vbxe-blitter skill, fire early / wait late): the blitter copies a BCB into
+;   its registers at START (Altirra vbxe.cpp LoadBlitter / LoadBCB) and never reads it
+;   again, so the callers write the fields at once and only the START waits -- here,
+;   hardened. (A START while busy is ignored: that, not a mid-blit BCB edit, dropped
+;   the small polygons the old leading waits were added for.)
+.proc fire_fill
+?w      lda VBXE_BL_BUSY
+        ora VBXE_BL_BUSY
+        bne ?w
+        lda #1
+        sta VBXE_BL_START
+        rts
+.endp
+.else
 .proc fire_fill
         lda #1
         sta VBXE_BL_START
         rts
 .endp
+.endif
 
-; blit_idle : spin until the blitter is idle. Called BEFORE every BCB edit
-;   (the blitter reads the BCB from VRAM while it runs, so modifying it mid-blit
-;   corrupts the in-flight span -- the cause of dropped small polygons). Also
-;   called before show_page so a displayed page is fully blitted.
+.if 1
+; span_mode : A = a solid colour ($00-$0F), $10 (transparent) or $11 (copy from page 0)
+;   -> the span BCB's mode fields and last_scol. No wait: the blitter reads a BCB only
+;   at START. (fill_poly_int has this inline, once per shape; the text calls it once
+;   per string.)
+.proc span_mode
+        sta last_scol
+        ldy slen_hi
+        sty BCB+BCB_WIDTH+1
+        cmp #$11
+        bcs ?copy
+        ldy #0
+        sty BCB+BCB_AND
+        cmp #$10
+        beq ?transp
+        sta BCB+BCB_XOR             ; solid : AND 0, XOR = colour, copy mode
+        lda #BLT_COPY
+        sta BCB+BCB_CTRL
+        rts
+?transp lda #$08                    ; transparent : dest |= 8
+        sta BCB+BCB_XOR
+        lda #BLT_OR
+        sta BCB+BCB_CTRL
+        rts
+?copy   lda #0                      ; copy : src page 0, step 1, AND $FF, XOR 0
+        sta BCB+BCB_SRC_ADDR+2
+        sta BCB+BCB_XOR
+        lda #1
+        sta BCB+BCB_SRC_STEPX
+        lda #$FF
+        sta BCB+BCB_AND
+        lda #BLT_COPY
+        sta BCB+BCB_CTRL
+        rts
+.endp
+.endif
+
+; blit_idle : spin until the blitter is idle -- before the CPU or the display uses what
+;   a blit writes (a page about to be shown, the cell index before a lookup). A BCB
+;   edit does not need it (the blitter reads a BCB only at START); a START waits in
+;   fire_fill / fill_span / the fused spans.
+.if 1
+;   HARDENED (vbxe-blitter skill): BUSY can read 0 for an instant between chained BCBs
+;   (the game's cell blit is a 2-BCB list), so idle = two reads in a row. Every path
+;   from a chained START to the next START passes through here.
 .proc blit_idle
-?w      lda VBXE_BL_BUSY
+?w      lda VBXE_BL_BUSY            ; two reads a pass: BUSY may read 0 for an instant
+        ora VBXE_BL_BUSY            ;   between chained BCBs
         bne ?w
         rts
 .endp
+.else
+.proc blit_idle
+?w      lda VBXE_BL_BUSY            ; hardened (vbxe skill): BUSY can read 0 for an
+        ora VBXE_BL_BUSY            ;   instant between chained BCBs -- a cell pair
+        bne ?w                      ;   may still be running when this is polled
+        rts
+.endp
+.endif
 
 .proc wait_vblank
         lda RTCLOK3
@@ -655,8 +966,20 @@ bcb_tmpl
 ; Replaces fill_span's per-span asl/rol multiply with one indexed read (#3).
 ; X is biased by $8000 (so the edge compare/clip is unsigned); that bias survives
 ; into sx (ROWBIAS), so pre-bias the table to cancel it: row_lut[sy] + sx = offset.
+.ifdef HIRES_CAP
+; GAME: page-aligned in the free $9948-$9BFF gap (SNAP ends $9947, RAMB is $9C00) --
+;   read twice per span, an unaligned table costs +1 cycle a read on a page cross
+row_tab_resume equ *
+        org $9A00
+row_lo  :SCRH dta <((#*SCRW-ROWBIAS)&$FFFF)
+        org $9B00
+row_hi  :SCRH dta >((#*SCRW-ROWBIAS)&$FFFF)
+        ert *>$9C00
+        org row_tab_resume
+.else
 row_lo  :SCRH dta <((#*SCRW-ROWBIAS)&$FFFF)
 row_hi  :SCRH dta >((#*SCRW-ROWBIAS)&$FFFF)
+.endif
 .ifdef HIRES_CAP
 row_lo2 :SCRH dta <((#*HR_SR_W-$8000)&$FFFF)   ; SR(320): y*320, pre-biased by -$8000
 row_hi2 :SCRH dta >((#*HR_SR_W-$8000)&$FFFF)

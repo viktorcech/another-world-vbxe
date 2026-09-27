@@ -4,11 +4,12 @@ verify_chain.py - simulate the boot loader's intro->game chain on the full disk.
 
 Replays src_game/bootloader.asm's get_byte/parse_seg state machine over
 awgame_full.atr starting at cur_sec=GAME_SEC (what intro_done jumps into) and
-checks: the XEX header, every segment (INIT/RUN handling included), and that
-the byte stream equals awgame.xex. Localises a broken ESC-skip chain to either
+checks: the XEX header, the stage-2 segment + its INIT (tools/pack_xex.py), and that
+the byte stream equals out/awgame_zx.bin -- the packed game the chain loads.
+(That it UNPACKS to awgame.xex is tools/verify_packed_load.py's job.) Localises a broken ESC-skip chain to either
 the disk layout (mismatch here) or the runtime state (parse is clean).
 
-    python tools/verify_chain.py [game_sec]     # default 2869
+    python tools/verify_chain.py [game_sec]     # default: 4 + sectors of out/awintro_zx.bin
 """
 import os, sys
 
@@ -18,9 +19,11 @@ SECTOR = 128
 
 
 def main():
-    game_sec = int(sys.argv[1]) if len(sys.argv) > 1 else 2869
+    # GAME_SEC as buildstep_join_disk.py lays the disk out: right behind the packed intro
+    intro = os.path.getsize(os.path.join(PROJ, 'out', 'awintro_zx.bin'))
+    game_sec = int(sys.argv[1]) if len(sys.argv) > 1 else 4 + -(-intro // SECTOR)
     atr = open(os.path.join(PROJ, 'awgame_full.atr'), 'rb').read()
-    xex = open(os.path.join(PROJ, 'awgame.xex'), 'rb').read()
+    xex = open(os.path.join(PROJ, 'out', 'awgame_zx.bin'), 'rb').read()
     hdr = atr[:16]
     assert hdr[0] == 0x96 and hdr[1] == 0x02, 'not an ATR'
     data = atr[16:]
@@ -61,9 +64,11 @@ def main():
         hi = gb_checked() | (gb_checked() << 8)
         if lo == 0x02E2:
             tgt = gb_checked() | (gb_checked() << 8)
-            print(f'  INIT -> ${tgt:04X}')
+            print(f'  INIT -> ${tgt:04X}   (stage 2: the rest is its record stream)')
             nseg += 1
-            continue
+            while stream_off[0] < len(xex):
+                gb_checked()
+            break
         if lo == 0x02E0:
             tgt = gb_checked() | (gb_checked() << 8)
             print(f'  RUN  -> ${tgt:04X}')
@@ -76,11 +81,11 @@ def main():
         nseg += 1
 
     print(f'{nseg} segments parsed, {stream_off[0]} bytes streamed '
-          f'(awgame.xex = {len(xex)} B), ended in sector {state["cur"] - 1}')
+          f'(awgame_zx.bin = {len(xex)} B), ended in sector {state["cur"] - 1}')
     if stream_off[0] != len(xex):
         print(f'  NOTE: stream ended {"before" if stream_off[0] < len(xex) else "after"} '
               f'the xex length -- trailing bytes unparsed')
-    print('chain byte stream: OK (identical to awgame.xex up to the RUN vector)')
+    print('chain byte stream: OK (identical to out/awgame_zx.bin)')
 
 
 if __name__ == '__main__':

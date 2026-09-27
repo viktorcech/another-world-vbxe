@@ -15,6 +15,56 @@
 ; vm_update_input : joystick 0 (PORTA + TRIG0) -> AW hero variables, once per
 ; frame (= game_sim.update_input).  Active-low switches: 0 bit = pressed.
 ;=============================================================================
+.if 1
+; Left/right and up/down are two independent 2-bit fields of PORTA (active low), so
+; each axis value and mask part is a 4-entry table: the later direction wins, as in
+; the branch chain (left over right, up over down). vm_s1/vm_s2 are no longer used.
+vm_update_input
+        lda #0
+        sta ATRACT                  ; kill OS attract mode every frame (the joystick
+        sta var_lo+V_ACTION         ;   never clears it -> colours cycle after ~9 min)
+        sta var_hi+V_ACTION
+        sta var_hi+V_MASK
+        sta var_hi+V_ACT_MASK
+        lda PORTA
+        tax
+        and #J_UP|J_DOWN
+        tay                         ; Y = up/down bits
+        txa
+        lsr @
+        lsr @
+        and #[J_LEFT|J_RIGHT]>>2
+        tax                         ; X = left/right bits
+        lda ?axlo,x                 ; lr = -1 left / +1 right / 0
+        sta var_lo+V_LEFT_RIGHT
+        lda ?axhi,x
+        sta var_hi+V_LEFT_RIGHT
+        lda ?axlo,y                 ; ud = jd = -1 up / +1 down / 0
+        sta var_lo+V_UP_DOWN
+        sta var_lo+V_JUMP_DOWN
+        lda ?axhi,y
+        sta var_hi+V_UP_DOWN
+        sta var_hi+V_JUMP_DOWN
+        lda TRIG0
+        lsr @                       ; C = 1 : fire NOT pressed
+        lda ?mlr,x
+        ora ?mud,y                  ; m = R1 L2 D4 U8 (lda / ora keep C)
+        sta var_lo+V_MASK
+        bcs ?nofire
+        ora #$80                    ; var[ACT_MASK] = m | (action<<7)
+        ldx #1
+        stx var_lo+V_ACTION
+?nofire sta var_lo+V_ACT_MASK
+        rts
+?axlo   dta $FF, $01, $FF, $00      ; index = bits (second, first) of the axis pair:
+?axhi   dta $FF, $00, $FF, $00      ;   0 both, 1 only the +1 side, 2 only the -1 side
+?mlr    dta 3, 1, 2, 0
+?mud    dta 12, 4, 8, 0
+        ert J_UP<>1
+        ert J_DOWN<>2
+        ert J_LEFT<>4
+        ert J_RIGHT<>8
+.else
 vm_update_input
         lda #0                      ; clear every hero axis first
         sta ATRACT                  ; ...and kill OS attract mode every frame: the joystick
@@ -82,6 +132,7 @@ vm_update_input
 ?nofire lda vm_s2
         sta var_lo+V_ACT_MASK
         rts
+.endif
 
 ;=============================================================================
 ; vm_check_code : press 'C' on the Atari keyboard -> switch to the access-code /

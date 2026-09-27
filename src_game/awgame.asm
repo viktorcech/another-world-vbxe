@@ -34,6 +34,7 @@ ICBLH       equ $0349
 ICAX1       equ $034A                  ;          aux 1 / aux 2
 ICAX2       equ $034B
 
+GAME_ZP = 1                            ; hot decoder / raster / VM / cache cells in zero page
         icl 'src/aw_equates.inc'       ; resolution switch, VRAM map, zero page, work RAM
         icl 'src_game/game_zp.inc'     ; GAME-only: decoder locals -> ZP (aw4.txt, union on $C0-$C6)
 
@@ -43,10 +44,12 @@ ICAX2       equ $034B
 ; hires = 0 : LR 160 (every gameplay scene) ; 1 : SR 320 (the access-code part 16008 only,
 ; so the password letters are readable -- zad.txt). Toggled in load_part by part index. ---
 HIRES_CAP = 1
-hires = RAMB+103                    ; +103..+127 free in both builds (see aw_equates note)
+ADV_ORG   = $0F80                   ; adv_edges1 -> the free gap (the chain is full)
+CELLCACHE = 1                       ; the shape-cell cache (intro: none)
+hires = $BB                         ; zero page (read per span / shape)
 cpu_detail = RAMB+104              ; saved detect_cpu value (0 Rapidus full / 1 stock half-vert);
                                    ; restored on LR parts, overridden to 0 (full) for 16008
-rpar      = RAMB+105              ; half-res per-polygon row parity (relative to the poly top, so
+rpar      = $D4                   ; half-res per-polygon row parity (relative to the poly top, so
                                   ; small polygons aren't dropped in half mode -- jail textures)
 HR_SR_W   = 320                     ; SR overlay width (bytes/line) and page stride
 SR_PXMODE = XDLC_ATT | XDLC_END     ; SR overlay control byte (no XDLC_LR)
@@ -57,6 +60,8 @@ LR_PXMODE = XDLC_ATT | XDLC_END | XDLC_LR
 
 game_start
         sei
+        ; (cld lives in the bootloader: one byte HERE shifts the whole $2000 chain
+        ;  and cost +126 cyc/frame in new page crossings -- measured 2026-09-25)
         lda PORTB
         ora #$02                       ; disable BASIC, keep OS ROM
         sta PORTB
@@ -97,7 +102,7 @@ game_start
         lda #0                         ; start in LR (gameplay); 16008 flips to SR
         sta hires
         ldx #0                         ; clear all 4 video pages to black
-        lda #0
+        ;lda #0
         jsr clear_page
         ldx #0
         lda #1
@@ -125,6 +130,7 @@ game_start
         sta pb_ptr+1
         lda #$FF
         sta last_scol
+        sta bcb_pg                  ; (the span BCB page / height shadow too)
 
 ;-----------------------------------------------------------------------------
 ; PHASE 1 : run the Another World VM (water part, 16002) frame by frame. The VM
@@ -184,7 +190,7 @@ game_start
 ?halt   jmp ?halt
 nv_edev dta c'E:',$9B
 nv_msg  dta c'VBXE NOT DETECTED!',$9B  ; ONE canonical text everywhere (loader,
-                                       ;   intro, game) -- make_full_atr.py checks
+                                       ;   intro, game) -- buildstep_join_disk.py checks
 nv_len  equ *-nv_msg
 .endp
 
@@ -217,7 +223,14 @@ disable_basic
 ; (the loader JMPs at RUN, so later segments would never load).
         org $B400
         icl 'src_game/game_diskio.asm' ; runtime ATR part loader (Phase 2)
+; snd_irq's state is the low byte of its `body jmp`: ph0/sph1/soff must share a page
+; (game_sound's ert). Pad so ph0 starts one -- the size depends only on where this
+; block ends, so it converges and follows every edit above.
+snd_pad_beg
+        .ds [[0 - [snd_pad_beg + [snd_irq.ph0 - snd_pad_end]]] & $FF]
+snd_pad_end
         icl 'src_game/game_sound.asm'  ; POKEY SFX player (op_sound) -- per-part VRAM samples
+        icl 'src/aw_raster_rare.asm' ; fill_poly_int's rare edge-step blocks (dy==1, dx<0)
         ert *>$C000                    ; $C000 = OS ROM. mads would happily emit a segment
                                        ;   ON TOP of it and the loader would write into
                                        ;   nothing -- this block is known to be near full.
@@ -230,6 +243,9 @@ disable_basic
 ; tools/check_xex.py: $0900 is not a reserved range and doesn't overlap any other segment.)
         org $0900
         icl 'src_game/game_text.asm'   ; op_drawstring (DRAWTEXT) -- intro glyph blitter
+; op_memlist (COLD, dispatch-reached): at game_text's end, still in $0900-$0BBF --
+; 90 B moved out of the $2000 hot chain (see the file's header).
+        icl 'src_game/game_vm_memlist.asm'
 
 ; Text data (font + 139-string table) at `org $1000` (free low RAM, clear of the VM
 ; vars/threads at $B000+), BEFORE game_data.asm's `run` segment.
@@ -239,5 +255,8 @@ disable_basic
 ; VRAM shape-cell cache (stage 1) -- decode+raster of recurring draws replaced by
 ; cell blits; lives in the free $AA00-$AFFF gap (sets its own org).
         icl 'src_game/game_cellcache.asm'
+; pages_xfer (COLD, jsr-only): assembles at the cellcache hot block's end, still
+; inside the guarded $AA00-$AFFF gap -- 134 B moved out of the $2000 hot chain.
+        icl 'src_game/game_vm_xfer.asm'
 ;=============================================================================
         icl 'src_game/game_data.asm'   ; pal_data, fmulu/poly tables, VRAM streaming, run

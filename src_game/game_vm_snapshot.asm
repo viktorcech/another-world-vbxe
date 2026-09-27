@@ -25,7 +25,11 @@
 ; that clobber the vars, so both must come back on the ESC return.
 ;=============================================================================
 .proc snapshot_state
+.if 1
+        ldx #63                     ; count down: the 64 entries are independent
+.else
         ldx #0
+.endif
 ?l      lda tpc_lo,x
         sta SNAP+0,x
         lda tpc_hi,x
@@ -36,9 +40,14 @@
         sta SNAP+192,x
         lda treq_hi,x
         sta SNAP+256,x
+.if 1
+        dex
+        bpl ?l
+.else
         inx
         cpx #64
         bne ?l
+.endif
         lda vm_cur1
         sta SNAP_G+0
         lda vm_cur2
@@ -61,8 +70,16 @@
         rts
 .endp
 
+.if 1
+        nocross restore_state, restore_state.rs_l, restore_state.rs_le   ; the 64-pass loop edge
+.endif
 .proc restore_state
+.if 1
+        ldx #63                     ; count down: the 64 entries are independent
+.else
         ldx #0
+.endif
+rs_l
 ?l      lda SNAP+0,x
         sta tpc_lo,x
         lda SNAP+64,x
@@ -73,9 +90,15 @@
         sta treq_lo,x
         lda SNAP+256,x
         sta treq_hi,x
+.if 1
+        dex
+        bpl ?l
+rs_le
+.else
         inx
         cpx #64
         bne ?l
+.endif
         lda SNAP_G+0
         sta vm_cur1
         lda SNAP_G+1
@@ -107,72 +130,10 @@
         beq ?npal                   ; (load_part already restreamed this part's pal_data)
         jsr set_palette
 ?npal   lda vm_cur2                 ; re-show the restored display page now (don't wait
-        jsr show_page               ;   for the scene's next blit op)
-        rts
+        jmp show_page               ;   for the scene's next blit op)
+        ;rts
 .endp
 
-;=============================================================================
-; pages_xfer : copy all 4 LR pages between VRAM and the PSAV0-3 snapshot slots.
-;   vm_s1 = 0 : pages -> slots (entering 16008 by 'C')
-;   vm_s1 = 1 : slots -> pages (ESC return; MUST run BEFORE load_part, which
-;               restreams poly/code/v2/sfx over the slots)
-;   Same proven blit geometry as copy_page (WIDTH-1=159, HEIGHT-1=199, STEPY=160),
-;   just with 24-bit src/dst bases; STEPYs are forced to the LR stride because the
-;   restore runs while the SR (16008) mode is still active. Pages are only ever
-;   saved from LR parts ('C' is ignored on parts 0/8), so 32000 B/page is right.
-;=============================================================================
-.proc pages_xfer
-        ldx #0
-?l      jsr blit_idle               ; the BCB must be idle before editing
-        lda #0
-        sta BCB+BCB_SRC_ADDR
-        sta BCB+BCB_DST_ADDR
-        lda vm_s1
-        bne ?rest
-        lda #0                      ; SAVE : src = page X ($00:pg:00:00)
-        sta BCB+BCB_SRC_ADDR+1
-        stx BCB+BCB_SRC_ADDR+2
-        lda psv_mid,x               ;        dst = slot X
-        sta BCB+BCB_DST_ADDR+1
-        lda psv_hi,x
-        sta BCB+BCB_DST_ADDR+2
-        jmp ?go
-?rest   lda psv_mid,x               ; RESTORE : src = slot X
-        sta BCB+BCB_SRC_ADDR+1
-        lda psv_hi,x
-        sta BCB+BCB_SRC_ADDR+2
-        lda #0                      ;           dst = page X
-        sta BCB+BCB_DST_ADDR+1
-        stx BCB+BCB_DST_ADDR+2
-?go     lda #<SCRW                  ; LR page geometry regardless of the current
-        sta BCB+BCB_SRC_STEPY       ;   render mode (SR is active during the restore)
-        sta BCB+BCB_DST_STEPY
-        lda #>SCRW
-        sta BCB+BCB_SRC_STEPY+1
-        sta BCB+BCB_DST_STEPY+1
-        lda #1
-        sta BCB+BCB_SRC_STEPX
-        lda #<(SCRW-1)
-        sta BCB+BCB_WIDTH
-        lda #>(SCRW-1)
-        sta BCB+BCB_WIDTH+1
-        lda #SCRH-1
-        sta BCB+BCB_HEIGHT
-        lda #$FF
-        sta BCB+BCB_AND
-        lda #0
-        sta BCB+BCB_XOR
-        lda #BLT_COPY
-        sta BCB+BCB_CTRL
-        jsr fire_fill
-        inx
-        cpx #4
-        bne ?l
-        jsr blit_idle               ; the last copy must land before SIO / display use
-        lda #$FF                    ; the span BCB mode fields were clobbered
-        sta last_scol
-        rts
-.endp
-psv_mid dta >[PSAV0&$FFFF], >[PSAV1&$FFFF], >[PSAV2&$FFFF], >[PSAV3&$FFFF]
-psv_hi  dta [PSAV0>>16], [PSAV1>>16], [PSAV2>>16], [PSAV3>>16]
+; pages_xfer + psv_mid/psv_hi moved to src_game/game_vm_xfer.asm (COLD -> out
+; of the $2000 hot chain, into the $AA00 gap after the cellcache hot block).
 

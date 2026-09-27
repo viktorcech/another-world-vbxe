@@ -215,9 +215,13 @@ def main():
     # ---- 5. the covox IRQ prologue (both players) --------------------------
     a = lab['cv_irq']
     ins, _ = walk(patched, a, 0x24)
-    jmps = [(m, v) for _, m, v in ins if m == 'jmp']
-    check(jmps and jmps[-1][1] == lab['body'],
-          f'cv_irq jmp -> ${jmps[-1][1]:04X} (want body ${lab["body"]:04X})')
+    # either `jmp body`, or `jmp (body+1)`: straight to the phase body's own jump
+    # holds (the game player's state is that jump's operand)
+    jmps = [(m, v) for _, m, v in ins if m in ('jmp', 'jmp ()')]
+    okj = bool(jmps) and ((jmps[-1][0] == 'jmp' and jmps[-1][1] == lab['body'])
+                          or (jmps[-1][0] == 'jmp ()' and jmps[-1][1] == lab['body'] + 1))
+    check(okj, f'cv_irq {jmps[-1] if jmps else None} (want jmp body ${lab["body"]:04X}'
+               f' or jmp (body+1))')
     stores = [v for _, m, v in ins if m == 'sta abs']
     check(0xD280 in stores and 0xD281 in stores,
           f'cv_irq writes both covox ports: {[hex(s) for s in stores]}')

@@ -46,6 +46,15 @@ param([switch]$ForceCovox)
 $version = "1.1"
 
 $ErrorActionPreference = "Stop"
+
+# Every build is transcribed 1:1 into out\build_check_<N>.txt (N counts builds, kept in
+# out\build_no.txt): the whole log, the RAM / zero-page map, the gates and the cycle
+# table against the previous build (tools\build_check.py, the last step below).
+$buildNo = 1
+if (Test-Path "out\build_no.txt") { $buildNo = [int](Get-Content "out\build_no.txt") + 1 }
+Set-Content -Path "out\build_no.txt" -Value $buildNo -Encoding ascii
+Start-Transcript -Path "out\build_check_$buildNo.txt" -Force | Out-Null
+trap { try { Stop-Transcript | Out-Null } catch {}; break }
 $mads = ".\mads.exe"
 $covoxDef = @()
 if ($ForceCovox) {
@@ -102,9 +111,17 @@ Write-Host "[intro] version line: $verStr"
 # --- intro pass 1 : measure its size to derive GAME_SEC ---------------------------
 Write-Host "[intro 3/5] assemble awintro.xex (pass 1, GAME_SEC placeholder)"
 & $mads "src\awvbxe.asm" "-d:GAME_SEC=0" @covoxDef "-o:awintro.xex" | Select-Object -Last 1
-$introSectors = Sectors "awintro.xex"
+$plainSectors = Sectors "awintro.xex"
+# The disk carries the intro ZX02-PACKED (tools/pack_xex.py -> out/awintro_zx.bin,
+# unpacked at load time by src_game/xex_unpack.asm through the boot loader's own
+# read_sec). That stage 2 needs the loader's addresses: assemble the loader once for
+# its label table -- PCT_STEP is an immediate, the addresses do not depend on it.
+& $mads "src_game\bootloader.asm" "-d:PCT_STEP=1" "-o:boot.xex" "-t:out\boot.lab" | Out-Null
+$introSectors = [int](python "tools\pack_xex.py" "--in" "awintro.xex" "--out" "out\awintro_zx.bin" | Select-Object -Last 1)
+if ($LASTEXITCODE -ne 0) { throw "pack_xex.py FAILED on the intro" }
+$introSectors += 1          # slack: pass 2 bakes GAME_SEC in, the packed size may move a byte
 $gameSec = 4 + $introSectors
-Write-Host "        intro = $introSectors sectors  ->  GAME_SEC = $gameSec"
+Write-Host "        intro = $plainSectors sectors plain, $introSectors packed  ->  GAME_SEC = $gameSec"
 
 # --- boot loader (3 sectors) : ALWAYS re-assembled --------------------------------
 # This used to be skipped when bootloader.asm was not NEWER than out/boot.bin, and
@@ -118,15 +135,15 @@ Write-Host "        intro = $introSectors sectors  ->  GAME_SEC = $gameSec"
 # PCT_STEP = sectors-per-percent, which exists only once the intro is measured.
 $pctStep = [math]::Max(1, [math]::Ceiling($introSectors / 100))
 Write-Host "[boot] assembling bootloader (PCT_STEP=$pctStep)..."
-& $mads "src_game\bootloader.asm" "-d:PCT_STEP=$pctStep" "-o:out\boot.xex" | Out-Null
-$b = [System.IO.File]::ReadAllBytes("out\boot.xex")
+& $mads "src_game\bootloader.asm" "-d:PCT_STEP=$pctStep" "-o:boot.xex" "-t:out\boot.lab" | Out-Null
+$b = [System.IO.File]::ReadAllBytes("boot.xex")
 [System.IO.File]::WriteAllBytes("out\boot.bin", $b[6..($b.Length-1)])
 
 # --- intro pass 2 : bake the real GAME_SEC (same byte size -> layout is stable) ---
 Write-Host "[intro 4/5] assemble awintro.xex (pass 2, GAME_SEC=$gameSec)"
 & $mads "src\awvbxe.asm" "-d:GAME_SEC=$gameSec" @covoxDef "-o:awintro.xex" "-l:out\awintro.lst" | Select-Object -Last 1
-if ((Sectors "awintro.xex") -ne $introSectors) {
-    throw "intro size changed between passes ($introSectors -> $(Sectors 'awintro.xex') sectors) -- GAME_SEC would be wrong"
+if ((Sectors "awintro.xex") -ne $plainSectors) {
+    throw "intro size changed between passes ($plainSectors -> $(Sectors 'awintro.xex') sectors)"
 }
 # The COVOX mode rewrites live IRQ code at run time (snd_go_covox), so mads can
 # only see one of the two versions. This replays the patch on the binary and
@@ -155,17 +172,27 @@ if ($LASTEXITCODE -ne 0) { throw "verify_covox_base.py FAILED - a chosen covox b
 # drive are parked at MID RAIL: on a 4-channel card they sum into the driven outputs.
 python "tools\verify_covox_preview.py" "awintro.xex" "out\awintro.lst" | Select-Object -Last 1
 if ($LASTEXITCODE -ne 0) { throw "verify_covox_preview.py FAILED - the menu test sound does not reach the DAC correctly" }
-Write-Host "        awintro.xex done ($introSectors sectors)"
+python "tools\pack_xex.py" "--in" "awintro.xex" "--out" "out\awintro_zx.bin" "--pad-to" "$introSectors" | Select-Object -Last 2 | Select-Object -First 1
+if ($LASTEXITCODE -ne 0) { throw "pack_xex.py FAILED on the intro, pass 2 -- GAME_SEC would be wrong" }
+Write-Host "        awintro.xex done ($plainSectors sectors plain, $introSectors on the disk)"
 
 # --- game : 2-pass xex + part table, rebased so the blob sits AFTER the intro -----
 Write-Host "[game 1/4] build xex (pass 1)"
 & $mads "src_game\awgame.asm" @covoxDef "-o:awgame.xex" "-l:out\awgame.lst" | Select-Object -Last 1
-Write-Host "[game 2/4] regenerate part table (base after intro; --xex-start $gameSec)"
-python "tools\make_game_atr.py" "--xex-start" "$gameSec" "--no-atr" | Select-Object -Last 1
+# awgame.xex goes onto the disk ZX02-PACKED too (same stage 2 as the intro). The part
+# blob sits right behind it, so its base needs the PACKED size: measure it on pass 1,
+# +1 sector of slack (pass 2 only changes table immediates), fix it for pass 2.
+$gameXexSectors = [int](python "tools\pack_xex.py" "--in" "awgame.xex" "--out" "out\awgame_zx.bin" | Select-Object -Last 1)
+if ($LASTEXITCODE -ne 0) { throw "pack_xex.py FAILED on the game" }
+$gameXexSectors += 1
+Write-Host "[game 2/4] regenerate part table (base after intro; --xex-start $gameSec, game $gameXexSectors packed sectors)"
+python "tools\make_game_atr.py" "--xex-start" "$gameSec" "--xex-sectors" "$gameXexSectors" "--no-atr" | Select-Object -Last 1
 Write-Host "[game 3/4] rebuild xex with the correct table (pass 2)"
 & $mads "src_game\awgame.asm" @covoxDef "-o:awgame.xex" "-l:out\awgame.lst" | Select-Object -Last 1
-Write-Host "[game 4/4] finalize part table"
-python "tools\make_game_atr.py" "--xex-start" "$gameSec" "--no-atr" | Select-Object -Last 1
+Write-Host "[game 4/4] finalize part table + pack the game"
+python "tools\make_game_atr.py" "--xex-start" "$gameSec" "--xex-sectors" "$gameXexSectors" "--no-atr" | Select-Object -Last 1
+python "tools\pack_xex.py" "--in" "awgame.xex" "--out" "out\awgame_zx.bin" "--pad-to" "$gameXexSectors" | Select-Object -Last 2 | Select-Object -First 1
+if ($LASTEXITCODE -ne 0) { throw "pack_xex.py FAILED on the game, pass 2 -- the part table would be wrong" }
 
 Write-Host "[guard] covox SMC check (game player)"
 python "tools\verify_covox.py" "awgame.xex" "out\awgame.lst" | Select-Object -Last 1
@@ -188,8 +215,20 @@ if ($LASTEXITCODE -ne 0) { throw "check_xex.py FAILED - an XEX segment lands in 
 
 # --- assemble the one bootable disk -----------------------------------------------
 Write-Host "[disk] assemble awgame_full.atr"
-python "tools\make_full_atr.py"
+python "tools\buildstep_join_disk.py"
 
 Write-Host ""
 Write-Host "Done. Boot awgame_full.atr on D1: in Altirra (VBXE required)."
 Write-Host "  -> intro with music; ESC (or its end) chains into the game."
+
+# --- build check: RAM / zero-page map, skill gates, cycles vs the previous build -----
+Write-Host ""
+Write-Host "[check] tools\build_check.py -> out\build_check_$buildNo.txt"
+python "tools\build_check.py" | Out-Host
+$checkOk = ($LASTEXITCODE -eq 0)
+Stop-Transcript | Out-Null
+if (-not $checkOk) {
+    # user rule 2026-09-25: the ATR stays even when a check fails ("najprv atr,
+    # potom verifikacie") -- fail loudly, but leave the disk for testing.
+    throw "build_check.py FAILED - see out\build_check_$buildNo.txt (awgame_full.atr KEPT)"
+}

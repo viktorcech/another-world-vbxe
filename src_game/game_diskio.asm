@@ -1,6 +1,6 @@
 ;=============================================================================
-; game_diskio.asm  -  runtime part loader: SIO-read a part's RAW resources from
-; the game ATR straight into VRAM, no DOS, no depacker.
+; game_diskio.asm  -  runtime part loader: SIO-read a part's ZX02-packed resources
+; from the game ATR and unpack them straight into VRAM (game_unpack.asm), no DOS.
 ;
 ;   The full game is too big for VRAM/RAM, so only ONE part is resident at a time.
 ;   load_part(index) overwrites the fixed VRAM banks with the new part:
@@ -215,7 +215,7 @@ hs_pbuf dta 0
         sta p_AUDF4
 
         ; ---- send command frame: $31 $52 auxlo auxhi chk ----
-        lda #$00
+        ;lda #$00
         sta p_SKCTL
         sta p_SKRES
         sta p_IRQEN
@@ -280,11 +280,11 @@ hs_pbuf dta 0
 ?rx     jsr ?get
         bcs ?fail
         sta ($32),y
-        clc
+        ;clc
         adc $34
         adc #$00                    ; end-around carry (Atari SIO checksum)
         sta $34
-        iny
+        iny                         ; skill-ok LOOPCP: SIO bytes arrive in order
         cpy #$80
         bne ?rx
 
@@ -328,7 +328,7 @@ hs_pbuf dta 0
         sta $34
         pla
 ?send_raw                           ; send A as-is
-        pha
+        pha                         ; skill-ok PHAPLA: this SIO block is not called
         jsr ?wait_txr
         pla
         sta p_SEROUT
@@ -378,8 +378,42 @@ hs_pbuf dta 0
 .endp
 
         ert *>$0F80                 ; aw_raster's adv_edges1 owns $0F80-$0FBA
+; op_resettask (COLD, dispatch-reached): at this $0DB0 section's end, still inside
+; the guarded $0DB0-$0F7F region -- ~100 B moved out of the $2000 hot chain.
+        icl 'src_game/game_vm_resettask.asm'
+
         org diskio_resume           ; --- back into the $B400 block ---
 
+; the ZX02 decoder: its own segment in the free $9EA8-$9FFF gap (behind the cell
+; cache's arena table, below the fmul tables) -- the $B400 block has no room.
+diskio_resume2 equ *
+        org $9EA8
+        icl 'src_game/game_unpack.asm'
+        org diskio_resume2
+
+.if 1
+;=============================================================================
+; stream_to_vram : unpack the resource at dk_sec into VRAM banks A, A+1, ...
+;   dk_cnt = its RAW sector count (> 0): one ZX02 stream per 128 sectors = bank.
+;=============================================================================
+.proc stream_to_vram
+        sta dk_bank
+        jsr pk_open
+?bank   lda dk_bank
+        jsr pk_bank                 ; -> C = 0
+        inc dk_bank
+        lda dk_cnt                  ; cnt -= 128 (C=0: sbc #127 takes 128)
+        sbc #127
+        sta dk_cnt
+        lda dk_cnt+1
+        sbc #0
+        sta dk_cnt+1
+        bcc ?done                   ; borrow: that was the last, partial bank
+        ora dk_cnt
+        bne ?bank
+?done   rts                         ; (no status: pk_fill retries until it reads)
+.endp
+.else
 ;=============================================================================
 ; stream_to_vram : load dk_cnt sectors from dk_sec into VRAM, base bank in A.
 ;   Reads up to 128 sectors (one 16K bank) at a time through the MEMAC-B window.
@@ -414,7 +448,7 @@ hs_pbuf dta 0
         jsr read_sectors
         bcs ?err
         lda dk_sec                  ; sec += n
-        clc
+        ;clc
         adc dk_n
         sta dk_sec
         bcc ?ns
@@ -432,6 +466,7 @@ hs_pbuf dta 0
 ?err    sec
         rts
 .endp
+.endif
 
 ;=============================================================================
 ; load_part : load part INDEX (X) from the ATR -> VRAM banks + palette RAM.
@@ -462,8 +497,8 @@ hs_pbuf dta 0
         bne ?noload
         jsr draw_loading
 ?noload ldx dk_idx                  ; draw_loading clobbered X -> restore the part index
-        lda #0                      ; stop any playing SFX: its VRAM is about to be
-        sta snd_active              ;   overwritten, and the Timer-1 IRQ must NOT touch
+        lda #<snd_irq.soff          ; stop any playing SFX: its VRAM is about to be
+        sta snd_irq.body+1          ;   overwritten, and the Timer-1 IRQ must NOT touch
         lda POKMSK                  ;   MEMAC-B while SIO streams through the window
         and #$FE
         sta POKMSK
@@ -517,6 +552,33 @@ hs_pbuf dta 0
         lda #3
         jsr ld_tint
     .endif
+    .if 1
+        ; --- video2 -> banks $1C, unless the banks still hold this very stream: parts
+        ;     16002-16007 share one v2, and make_game_atr stores identical resources
+        ;     once, so the same start sector = the same data. v2_res = the stream in
+        ;     $1C.. (0 = none: a part without v2 lets the cell cache / the 16008
+        ;     snapshot slots use that region). Sector 0 in the table = no v2. ---
+        ldx dk_idx
+        lda atr_v2_sec_lo,x
+        ldy atr_v2_sec_hi,x
+        cmp v2_res
+        bne ?ldv2
+        cpy v2_res+1
+        beq ?nov2                   ; resident (or none and none): nothing to read
+?ldv2   sta v2_res
+        sty v2_res+1
+        sta dk_sec
+        sty dk_sec+1
+        ora v2_res+1                ; lo | hi = 0 -> this part has no v2
+        beq ?nov2
+        lda atr_v2_cnt_lo,x
+        sta dk_cnt
+        lda atr_v2_cnt_hi,x
+        sta dk_cnt+1
+        lda #POLY_BANK0+8
+        jsr stream_to_vram
+?nov2
+    .else
         ; --- video2 -> banks $1C (skip if this part has none) ---
         ldx dk_idx
         lda atr_v2_cnt_lo,x
@@ -534,11 +596,25 @@ hs_pbuf dta 0
         lda #POLY_BANK0+8
         jsr stream_to_vram
 ?nov2
+    .endif
     .ifdef LOAD_DEBUG
         lda #4
         jsr ld_tint
     .endif
         ; --- palette -> RAM pal_data ($9000) ---
+    .if 1
+        ldx dk_idx                  ; one ZX02 stream (1536 B) straight into RAM
+        lda atr_pal_sec_lo,x
+        sta dk_sec
+        lda atr_pal_sec_hi,x
+        sta dk_sec+1
+        jsr pk_open
+        lda #<pal_data
+        sta zx_dst
+        lda #>pal_data
+        sta zx_dst+1
+        jsr pk_dec
+    .else
         ldx dk_idx
         lda atr_pal_sec_lo,x
         sta DAUX1
@@ -552,6 +628,7 @@ hs_pbuf dta 0
         lda atr_pal_cnt,x
         tax
         jsr read_sectors
+    .endif
     .ifdef LOAD_DEBUG
         lda #5
         jsr ld_tint
@@ -569,8 +646,50 @@ hs_pbuf dta 0
     .endif
         sei                         ; back to IRQ-off for the VM
         rts
+v2_res  dta a(0)                    ; start sector of the v2 stream in banks $1C.. (0 = none)
 .endp
 
+.if 1
+;=============================================================================
+; load_sounds : unpack part dk_idx's sound blob (atr_snd_sec, RAW count atr_snd_cnt)
+;   into the 7 NON-contiguous snd_blist VRAM banks, one ZX02 stream per bank.
+;   IRQ is already enabled (called inside load_part's cli region).
+;=============================================================================
+.proc load_sounds
+        ldx dk_idx
+        lda atr_snd_cnt_lo,x
+        sta ls_rem
+        lda atr_snd_cnt_hi,x
+        sta ls_rem+1
+        ora ls_rem
+        beq ?done                   ; no sounds for this part
+        lda atr_snd_sec_lo,x
+        sta dk_sec
+        lda atr_snd_sec_hi,x
+        sta dk_sec+1
+        jsr pk_open
+        ldx #0                      ; snd_blist index
+?loop   stx ls_bi
+        lda snd_blist,x
+        and #$7F                    ; bare bank (pk_bank re-ORs $80)
+        jsr pk_bank                 ; -> C = 0
+        lda ls_rem                  ; rem -= 128 (C=0: sbc #127 takes 128)
+        sbc #127
+        sta ls_rem
+        lda ls_rem+1
+        sbc #0
+        sta ls_rem+1
+        bcc ?done                   ; borrow: that was the last, partial bank
+        ora ls_rem
+        beq ?done
+        ldx ls_bi
+        inx
+        bne ?loop                   ; X <= SND_NBANK: always
+?done   rts
+ls_rem  dta a(0)
+ls_bi   dta 0
+.endp
+.else
 ;=============================================================================
 ; load_sounds : stream part dk_idx's sound blob (atr_snd_sec/cnt) from the ATR
 ;   across the 7 NON-contiguous snd_blist VRAM banks ($0E,$0F,$11,$12,$13,$1E,$1F)
@@ -622,6 +741,7 @@ ls_rem  dta a(0)
 ls_n    dta 0
 ls_bi   dta 0
 .endp
+.endif
 
 ;=============================================================================
 ; load_bitmap : stream a decoded background bitmap (an LR page = 250 sectors,

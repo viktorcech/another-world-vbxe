@@ -26,3 +26,7 @@ __pycache__/
 
 # editor / agent
 .claude/
+
+# scratch test/debug scripts
+/tools/tests/
+tools/gp_over_*.txt

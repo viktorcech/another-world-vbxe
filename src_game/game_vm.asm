@@ -125,7 +125,12 @@ pl_bank  = $B3
 ; zero-page scratch (the $B8-$BD gap, free per aw_equates.inc)
 vm_t     = $B8                      ; current thread index
 vm_ssp   = $B9                      ; call-stack pointer
+.if 1
+vm_maxt  = vmx_2+1                   ; run-loop watermark: the operand of the scan's cpx #
+.else                               ;   (6502 skill: a variable as an immediate operand)
 vm_maxt  = $BA                      ; run-loop watermark: highest thread index ever
+.endif
+        ; ($BA was vm_maxt's zero-page cell, now free)
                                     ;   installed + 1 (the scheduler scans 0..maxt-1
                                     ;   only). Was vm_goto -- the slice-end flag is
                                     ;   gone (handlers exit via vm_exit/rts directly).
@@ -137,13 +142,13 @@ vm_s2    = $BD                      ; word-fetch high / general scratch
 ; not touched by the raster, so it survives a draw). NOTE: poly_bcb_h lives at +102
 ; (aw_equates.inc) -- keep these vm_* vars below it (+93..+101). +94 is FREE
 ; (the old vm_jmp dispatch cell -> replaced by SMC at vm_disp; see vm_fetch).
-req_any  = RAMB+93                  ; 1 = treq/tpreq posted since the last apply scan
+req_any  = $E6                  ; 1 = treq/tpreq posted since the last apply scan
                                     ;   (lets vm_run_frame skip the 64-thread scan)
-vm_op    = RAMB+95                  ; saved draw opcode / scratch
-vm_d     = RAMB+96                  ; dest var index / scratch
-vm_sub   = RAMB+97                  ; condjmp sub byte
-vm_b2lo  = RAMB+98                  ; condjmp operand
-vm_b2hi  = RAMB+99
+vm_op    = $E1                  ; saved draw opcode / scratch
+vm_d     = $E2                  ; dest var index / scratch
+vm_sub   = $E3                  ; condjmp sub byte
+vm_b2lo  = $E4                  ; condjmp operand
+vm_b2hi  = $E5
 vm_dstlo = RAMB+100                 ; condjmp destination PC
 vm_dsthi = RAMB+101
 ; BUGFIX (2026-07-02): cp_vs/cp_vd lived at RAMB+104/+105 -- COLLIDING with
@@ -230,7 +235,11 @@ GAME_START_POS = 0
 ; page state are NOT touched -- they persist across a part switch (= load_part).
 ;=============================================================================
 vm_reset_threads
+.if 1
+        ldx #63                     ; count down: the 64 entries are independent
+.else
         ldx #0
+.endif
 ?tz     lda #$FF
         sta tpc_hi,x                ; INACTIVE
         sta treq_lo,x
@@ -239,12 +248,16 @@ vm_reset_threads
         lda #0
         sta tpc_lo,x
         sta tpause,x
+.if 1
+        dex
+        bpl ?tz
+.else
         inx
         cpx #64
         bne ?tz
-        lda #0                      ; thread 0 active at pc 0
-        sta tpc_lo
-        sta tpc_hi
+.endif
+        lda #0                      ; thread 0 active at pc 0 (tpc_lo[0] = 0 from the
+        sta tpc_hi                  ;   loop)
         sta req_any                 ; all requests are NO_REQ -> nothing pending
         lda #1
         sta vm_maxt                 ; only thread 0 is active -> scan 0..0 (the
@@ -267,4 +280,4 @@ vm_reset_threads
         icl 'src_game/game_vm_ops2.asm'      ; opcodes 0x0B-0x10 (page / palette / display) + copy_page_vs
         icl 'src_game/game_vm_ops3.asm'      ; opcodes 0x11-0x1A (remove / bitwise / sound / resource)
         icl 'src_game/game_vm_draw.asm'      ; draw_bg, draw_sprite, do_draw
-        icl 'src_game/game_vm_optab.asm'     ; vm_oplo/vm_ophi split dispatch tables
+        icl 'src_game/game_vm_optab.asm'     ; vm_optab: the opcode dispatch word table
