@@ -74,6 +74,10 @@ The single script is deliberate. The intro's size decides where the game xex and
 | `tools/` | Python pipeline (asset packing, ATR builder, simulators, profilers, build guards) |
 | `build.ps1` | The build |
 
+## License
+
+Free software under the GNU GPL v2 (see [LICENSE](LICENSE)). Another World game data is not included and remains © Éric Chahi.
+
 ## Credits
 
 - Original game: **Another World** — created by Éric Chahi, originally published by Delphine Software (1991); IP owned by Éric Chahi.
